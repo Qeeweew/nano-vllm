@@ -10,7 +10,7 @@ from nanovllm.models.qwen3 import Qwen3ForCausalLM
 from nanovllm.layers.sampler import Sampler
 from nanovllm.utils.context import set_context, get_context, reset_context
 from nanovllm.utils.loader import load_model
-
+from nanovllm.utils.quantize import quantize_and_replace_mlp
 
 class ModelRunner:
 
@@ -30,6 +30,10 @@ class ModelRunner:
         torch.set_default_device("cuda")
         self.model = Qwen3ForCausalLM(hf_config)
         load_model(self.model, config.model)
+
+        quantize_and_replace_mlp(self.model)
+
+
         self.sampler = Sampler()
         self.warmup_model()
         self.allocate_kv_cache()
