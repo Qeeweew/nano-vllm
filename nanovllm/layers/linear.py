@@ -3,6 +3,56 @@ from torch import nn
 import torch.nn.functional as F
 import torch.distributed as dist
 
+class CPULinear(nn.Module):
+    def __init__(
+        self,
+        input_size: int,
+        output_size: int,
+        bias: bool = False,
+    ):
+        super().__init__()
+        self.weight = nn.Parameter(torch.empty(output_size, input_size, device="cpu"))
+        if bias:
+            self.bias = nn.Parameter(torch.empty(output_size, device="cpu"))
+        else:
+            self.register_parameter("bias", None)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Expects x to be on CPU
+        return F.linear(x, self.weight, self.bias)
+
+
+class MergedCPULinear(nn.Module):
+    def __init__(
+        self,
+        input_size: int,
+        output_sizes: list[int],
+        bias: bool = False,
+    ):
+        super().__init__()
+        self.output_sizes = output_sizes
+        output_size = sum(output_sizes)
+        self.weight = nn.Parameter(torch.empty(output_size, input_size, device="cpu"))
+        self.weight.weight_loader = self.weight_loader
+        if bias:
+            self.bias = nn.Parameter(torch.empty(output_size, device="cpu"))
+            self.bias.weight_loader = self.weight_loader
+        else:
+            self.register_parameter("bias", None)
+
+    def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor, loaded_shard_id: int):
+        param_data = param.data
+        shard_offset = sum(self.output_sizes[:loaded_shard_id])
+        shard_size = self.output_sizes[loaded_shard_id]
+        
+        # This works for both 1D (bias) and 2D (weight) parameters
+        param_data = param_data.narrow(0, shard_offset, shard_size)
+        param_data.copy_(loaded_weight)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Expects x to be on CPU
+        return F.linear(x, self.weight, self.bias)
+
 
 def divide(numerator, denominator):
     assert numerator % denominator == 0

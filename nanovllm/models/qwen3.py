@@ -6,7 +6,7 @@ from transformers import Qwen3Config
 from nanovllm.layers.activation import SiluAndMul
 from nanovllm.layers.attention import Attention
 from nanovllm.layers.layernorm import RMSNorm
-from nanovllm.layers.linear import QKVParallelLinear, MergedColumnParallelLinear, RowParallelLinear
+from nanovllm.layers.linear import QKVParallelLinear, RowParallelLinear, CPULinear, MergedCPULinear
 from nanovllm.layers.rotary_embedding import get_rope
 from nanovllm.layers.embed_head import VocabParallelEmbedding, ParallelLMHead
 
@@ -91,12 +91,12 @@ class Qwen3MLP(nn.Module):
         hidden_act: str,
     ) -> None:
         super().__init__()
-        self.gate_up_proj = MergedColumnParallelLinear(
+        self.gate_up_proj = MergedCPULinear(
             hidden_size,
             [intermediate_size] * 2,
             bias=False,
         )
-        self.down_proj = RowParallelLinear(
+        self.down_proj = CPULinear(
             intermediate_size,
             hidden_size,
             bias=False,
@@ -105,10 +105,18 @@ class Qwen3MLP(nn.Module):
         self.act_fn = SiluAndMul()
 
     def forward(self, x):
-        gate_up = self.gate_up_proj(x)
-        x = self.act_fn(gate_up)
-        x = self.down_proj(x)
-        return x
+        orig_device = x.device
+        # 将输入张量从GPU移动到CPU
+        x_cpu = x.to("cpu")
+
+        # 在CPU上执行MLP计算
+        gate_up = self.gate_up_proj(x_cpu)
+        x_cpu = self.act_fn(gate_up)
+        x_cpu = self.down_proj(x_cpu)
+
+        # 将结果张量移回原始GPU设备
+        return x_cpu.to(orig_device)
+
 
 
 class Qwen3DecoderLayer(nn.Module):
