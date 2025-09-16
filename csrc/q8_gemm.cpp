@@ -584,7 +584,7 @@ static void silu_and_mul(float* C, int num_tokens, int intermediate_size) {
                 Vec up_vec = Vec::loadu(up_part + j);
 
                 const Vec one_vec(1.0f);
-                Vec activation_vec = gate_vec / (one_vec + (-gate_vec).exp());
+                Vec activation_vec = gate_vec / (one_vec + gate_vec.neg().exp());
                 Vec result_vec = up_vec * activation_vec;
 
                 result_vec.store(row + j);
