@@ -12,7 +12,7 @@ def main():
     max_ouput_len = 1024
 
     # enforce_eager = True to disable cuda graph
-    path = os.path.expanduser("~/workspace/models/Qwen3-0.6B/")
+    path = os.path.expanduser("~/workspace/models/OLMoE-1B-7B-0924/")
     llm = LLM(path, enforce_eager=True, max_model_len=4096)
 
     prompt_token_ids = [[randint(0, 10000) for _ in range(randint(1, max_input_len))] for _ in range(num_seqs)]

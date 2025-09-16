@@ -51,17 +51,17 @@ def quantize_and_replace_mlp(model):
 def quantize_and_replace_moe_mlp(model):
     """
     Finds all OlmoeSparseMoeBlock modules, quantizes their expert MLPs' weights,
-    and replaces the original CPU linear layers with QuantizedLinear layers.
+    replaces linear layers with QuantizedLinear, and then stacks the expert weights
+    into single tensors for the high-performance C++ kernel.
     """
     print("Quantizing and replacing Olmoe expert MLP layers for CPU acceleration...")
     
-    # Iterate through each decoder layer in the model
+    # Step 1: Quantize and replace linear layers within each expert
     for layer in model.model.layers:
         moe_block = layer.mlp
         if not isinstance(moe_block, OlmoeSparseMoeBlock):
             continue
 
-        # Iterate through each expert in the MoE block
         for i, expert_mlp in enumerate(moe_block.experts):
             assert isinstance(expert_mlp, OlmoeMLP), f"Expert {i} is not an OlmoeMLP"
 
@@ -77,8 +77,6 @@ def quantize_and_replace_moe_mlp(model):
             q_gate_up.quantize(old_gate_up.weight.data)
             if old_gate_up.bias is not None:
                 q_gate_up.bias.data.copy_(old_gate_up.bias.data)
-            
-            # Replace the old layer with the new quantized one
             expert_mlp.gate_up_proj = q_gate_up
             
             # --- Quantize and replace down_proj ---
@@ -93,8 +91,35 @@ def quantize_and_replace_moe_mlp(model):
             q_down.quantize(old_down.weight.data)
             if old_down.bias is not None:
                 q_down.bias.data.copy_(old_down.bias.data)
-                
-            # Replace the old layer with the new quantized one
             expert_mlp.down_proj = q_down
 
     print("Olmoe expert MLP quantization complete.")
+    print("Stacking expert weights for C++ kernel...")
+
+    # Step 2: Stack the quantized weights from all experts and clean up
+    for layer in model.model.layers:
+        moe_block = layer.mlp
+        if not isinstance(moe_block, OlmoeSparseMoeBlock):
+            continue
+        
+        gate_up_qs, gate_up_d = [], []
+        down_proj_qs, down_proj_d = [], []
+
+        for expert_mlp in moe_block.experts:
+            gate_up_qs.append(expert_mlp.gate_up_proj.weight_qs)
+            gate_up_d.append(expert_mlp.gate_up_proj.weight_d)
+            down_proj_qs.append(expert_mlp.down_proj.weight_qs)
+            down_proj_d.append(expert_mlp.down_proj.weight_d)
+        
+        # Stack along a new dimension (dim=0)
+        moe_block.gate_up_qs_stacked = torch.stack(gate_up_qs, dim=0)
+        moe_block.gate_up_d_stacked = torch.stack(gate_up_d, dim=0)
+        moe_block.down_proj_qs_stacked = torch.stack(down_proj_qs, dim=0)
+        moe_block.down_proj_d_stacked = torch.stack(down_proj_d, dim=0)
+
+        # Free the memory of individual expert modules as they are no longer needed
+        del moe_block.experts
+        moe_block.experts = None
+
+    print("Expert weight stacking complete. Redundant expert modules have been removed.")
+

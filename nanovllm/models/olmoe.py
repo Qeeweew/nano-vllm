@@ -106,80 +106,68 @@ class OlmoeMLP(nn.Module):
         x = self.down_proj(x)
         return x
 
+import nanovllm_ext
+
 class OlmoeSparseMoeBlock(nn.Module):
     """
     Sparse MoE block with CPU offloading for experts.
     The router (gate) runs on GPU. After routing, all expert computations
-    are performed on the CPU in float32 for performance, and the final
-    result is copied back to the GPU.
-    This version is adapted for 2D tensor inputs [num_tokens, hidden_dim].
+    are performed on the CPU in float32 using a high-performance C++ kernel.
+    Assumes that expert weights have been quantized and stacked offline by the
+    `quantize_and_replace_moe_mlp` function.
     """
     def __init__(self, config: OlmoeConfig):
         super().__init__()
         self.num_experts = config.num_experts
         self.top_k = config.num_experts_per_tok
 
-        self.norm_topk_prob = getattr(config, "norm_topk_prob", False)
+        self.norm_top_k_prob = getattr(config, "norm_top_k_prob", False)
 
         # Gate runs on GPU to select experts
         self.gate = ReplicatedLinear(config.hidden_size, self.num_experts, bias=False)
 
-        # Experts are OlmoeMLPs, which are composed of CPULinear/QuantizedLinear layers.
-        # They will be instantiated on CPU and their weights will be loaded there.
+        # This list will be populated, used for quantization, and then removed.
         self.experts = nn.ModuleList([OlmoeMLP(config) for _ in range(self.num_experts)])
+
+        # Buffers for stacked quantized weights. These will be populated by the quantization utility.
+        self.register_buffer("gate_up_qs_stacked", torch.empty(0, dtype=torch.int8))
+        self.register_buffer("gate_up_d_stacked", torch.empty(0, dtype=torch.half))
+        self.register_buffer("down_proj_qs_stacked", torch.empty(0, dtype=torch.int8))
+        self.register_buffer("down_proj_d_stacked", torch.empty(0, dtype=torch.half))
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         # Input hidden_states is expected to be 2D: [num_tokens, hidden_dim]
         if hidden_states.dim() != 2:
-             raise ValueError(f"OlmoeSparseMoeBlock expects a 2D input, but got shape {hidden_states.shape}")
+            raise ValueError(f"OlmoeSparseMoeBlock expects a 2D input, but got shape {hidden_states.shape}")
 
         orig_device = hidden_states.device
         orig_dtype = hidden_states.dtype
         
         # === 1. GPU Part: Routing ===
-        # Gate computation on GPU is efficient for the large matrix multiplication.
         router_logits = self.gate(hidden_states)
         routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
         routing_weights, selected_experts = torch.topk(routing_weights, self.top_k, dim=-1)
 
-        if self.norm_topk_prob:
+        if self.norm_top_k_prob:
             routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
 
-
         # === 2. Transfer Data to CPU ===
-        # Move all necessary tensors to CPU at once.
-        # Use float32 for CPU computations as requested.
         hidden_states_cpu = hidden_states.to(device="cpu", dtype=torch.float32)
         routing_weights_cpu = routing_weights.to(device="cpu")
-        selected_experts_cpu = selected_experts.to(device="cpu")
+        selected_experts_cpu = selected_experts.to(device="cpu", dtype=torch.int32)
 
-        # === 3. CPU Part: Expert Computation ===
-        # Initialize the output tensor on the CPU.
-        final_hidden_states_cpu = torch.zeros_like(hidden_states_cpu)
-
-        # Create the expert mask on the CPU.
-        expert_mask = torch.nn.functional.one_hot(selected_experts_cpu, num_classes=self.num_experts).permute(2, 1, 0)
-
-        for expert_idx in range(self.num_experts):
-            expert_layer = self.experts[expert_idx]
-            top_k_idx, token_indices = torch.where(expert_mask[expert_idx])
-
-            if token_indices.numel() == 0:
-                continue
-
-            # All subsequent operations are on the CPU, no more device transfers inside the loop.
-            expert_inputs = hidden_states_cpu[token_indices]
-            
-            # Compute on CPU
-            expert_outputs = expert_layer(expert_inputs)
-
-            # Weight the outputs and scatter them back
-            weights = routing_weights_cpu[token_indices, top_k_idx, None]
-            weighted_outputs = expert_outputs * weights
-            final_hidden_states_cpu.index_add_(0, token_indices, weighted_outputs)
+        # === 3. CPU Part: Expert Computation via C++ Kernel ===
+        final_hidden_states_cpu = nanovllm_ext.moe_q8_forward(
+            hidden_states_cpu,
+            routing_weights_cpu,
+            selected_experts_cpu,
+            self.gate_up_qs_stacked,
+            self.gate_up_d_stacked,
+            self.down_proj_qs_stacked,
+            self.down_proj_d_stacked
+        )
         
         # === 4. Transfer Result back to GPU ===
-        # Copy the final aggregated tensor back to the original GPU and cast to the original dtype.
         return final_hidden_states_cpu.to(device=orig_device, dtype=orig_dtype)
 
 class OlmoeDecoderLayer(nn.Module):

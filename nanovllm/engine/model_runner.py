@@ -47,10 +47,19 @@ class ModelRunner:
             quantize_and_replace_mlp(self.model)
 
         self.sampler = Sampler()
+        import time
+        print(f"[Rank {self.rank}] Initializing Sampler complete. Starting model warmup...")
+        start_time = time.time()
+
         self.warmup_model()
+
+        print(f"[Rank {self.rank}] Model warmup finished in {time.time() - start_time:.2f} seconds. Allocating KV cache...")
+        start_time = time.time()
+        
         self.allocate_kv_cache()
         if not self.enforce_eager:
             self.capture_cudagraph()
+
         torch.set_default_device("cpu")
         torch.set_default_dtype(default_dtype)
 
@@ -107,9 +116,10 @@ class ModelRunner:
     def warmup_model(self):
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
-        max_num_batched_tokens, max_model_len = self.config.max_num_batched_tokens, self.config.max_model_len
-        num_seqs = min(max_num_batched_tokens // max_model_len, self.config.max_num_seqs)
-        seqs = [Sequence([0] * max_model_len) for _ in range(num_seqs)]
+        print("[Warmup] Using a minimal workload to speed up initialization.")
+        num_seqs = 1
+        warmup_seq_len = 128  # Use a much shorter sequence length
+        seqs = [Sequence([0] * warmup_seq_len) for _ in range(num_seqs)]
         self.run(seqs, True)
         torch.cuda.empty_cache()
 
@@ -118,19 +128,45 @@ class ModelRunner:
         hf_config = config.hf_config
         free, total = torch.cuda.mem_get_info()
         used = total - free
-        peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
-        current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
+
+        # --- START OF MODIFICATION ---
+        # peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"] # This is from the slow warmup
+        # current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
+        
+        # Heuristic approach: Reserve a fixed buffer for activations and temporary tensors.
+        # This value may need tuning depending on the model and max batch size.
+        # 2 GB is a reasonable starting point for models around 7B.
+        activation_memory_buffer_gb = 2.0
+        activation_memory_buffer_bytes = int(activation_memory_buffer_gb * (1024**3))
+        
+        print(f"[KV Cache] Total GPU memory: {total/1e9:.2f} GB")
+        print(f"[KV Cache] Used by weights: {used/1e9:.2f} GB")
+        print(f"[KV Cache] Reserving {activation_memory_buffer_gb} GB for activations.")
+        
+        # The available memory for KV cache is what's left after accounting for weights and the activation buffer.
+        available_for_kv = total * config.gpu_memory_utilization - used - activation_memory_buffer_bytes
+        # --- END OF MODIFICATION ---
+
         num_kv_heads = hf_config.num_key_value_heads // self.world_size
 
-        # Calculate head_dim if it's not explicitly in the config (e.g., for Olmoe)
         if hasattr(hf_config, 'head_dim') and hf_config.head_dim is not None:
             head_dim = hf_config.head_dim
         else:
             head_dim = hf_config.hidden_size // hf_config.num_attention_heads
 
         block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * head_dim * hf_config.torch_dtype.itemsize
-        config.num_kvcache_blocks = int(total * config.gpu_memory_utilization - used - peak + current) // block_bytes
-        assert config.num_kvcache_blocks > 0
+        
+        # --- ORIGINAL CALCULATION using peak memory ---
+        # config.num_kvcache_blocks = int(total * config.gpu_memory_utilization - used - peak + current) // block_bytes
+        
+        # --- NEW CALCULATION using heuristic ---
+        config.num_kvcache_blocks = int(available_for_kv) // block_bytes
+        # --- END OF MODIFICATION ---
+        
+        print(f"[KV Cache] Calculated block bytes: {block_bytes}")
+        print(f"[KV Cache] Allocating {config.num_kvcache_blocks} KV cache blocks.")
+
+        assert config.num_kvcache_blocks > 0, "Not enough memory for KV cache. Try increasing gpu_memory_utilization or decreasing the activation buffer."
         self.kv_cache = torch.empty(2, hf_config.num_hidden_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads, head_dim)
         layer_id = 0
         for module in self.model.modules():

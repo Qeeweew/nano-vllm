@@ -9,6 +9,7 @@
 #include <cassert>
 #include <algorithm>
 #include <ATen/Parallel.h>
+#include <ATen/cpu/vec/vec.h>
 
 #if defined(__ARM_NEON)
 #include <arm_neon.h>
@@ -373,7 +374,7 @@ void gemm_q8_0_microkernel(int kc_size, int mr, const int8_t* A_qs_packed, const
     }
 }
 
-void gemm_q8_0_aten_parallel_packed(int M, int N, int K, const float* A, const int8_t* B_qs_packed, const ggml_half* B_d_packed_f16, float* C) {
+void gemm_q8_0_aten_parallel_packed(int M, int N, int K, const float* A, int lda, const int8_t* B_qs_packed, const ggml_half* B_d_packed_f16, float* C) {
     assert(K % QK8_0 == 0);
     const int K_BLOCKS = K / QK8_0;
     const int M_CEIL = (M + MR - 1) / MR * MR;
@@ -391,7 +392,7 @@ void gemm_q8_0_aten_parallel_packed(int M, int N, int K, const float* A, const i
                 int M_rem = std::min(MR, M - i);
                 float* current_A_d_ptr = A_d_packed + i * K_BLOCKS + j * MR;
                 for (int row = 0; row < M_rem; ++row) {
-                    quantize_block_q8_0(A + (i + row) * K + j * QK8_0, &current_A_d_ptr[row], &a_qs_buf[row * QK8_0]);
+                    quantize_block_q8_0(A + (i + row) * lda + j * QK8_0, &current_A_d_ptr[row], &a_qs_buf[row * QK8_0]);
                 }
                 int8_t* current_qs_ptr = A_qs_packed + i * K + j * QK8_0 * MR;
                 for (int k = 0; k < QK8_0; k += 4) {
@@ -498,7 +499,7 @@ torch::Tensor q8_gemm(
 
     gemm_q8_0_aten_parallel_packed(
         M, N, K,
-        A_float.data_ptr<float>(),
+        A_float.data_ptr<float>(), K,
         B_qs_packed.data_ptr<int8_t>(),
         reinterpret_cast<const ggml_half*>(B_d_packed.data_ptr<at::Half>()),
         C_tensor.data_ptr<float>()
@@ -507,7 +508,216 @@ torch::Tensor q8_gemm(
     return C_tensor;
 }
 
+struct MoETokenInfo {
+    int32_t token_id;
+    int32_t expert_idx_in_tok; // The k-th expert for this token (0 to top_k-1)
+};
+
+// Preprocesses routing information to create maps for efficient gather and scatter.
+static void preprocess_moe_routing(
+    int num_experts, int top_k, int num_tokens,
+    const int32_t* selected_experts,
+    std::vector<int>& expert_counts,
+    std::vector<int>& expert_starts,
+    std::vector<MoETokenInfo>& token_map,   // For gather (expert-centric)
+    std::vector<int32_t>& scatter_map      // For scatter (token-centric)
+) {
+    // Count tokens per expert
+    for (int t = 0; t < num_tokens; ++t) {
+        for (int k = 0; k < top_k; ++k) {
+            int expert_id = selected_experts[t * top_k + k];
+            if (expert_id >= 0 && expert_id < num_experts) {
+                expert_counts[expert_id]++;
+            }
+        }
+    }
+
+    // Calculate start indices for each expert's token batch
+    expert_starts[0] = 0;
+    for (int i = 0; i < num_experts; ++i) {
+        expert_starts[i + 1] = expert_starts[i] + expert_counts[i];
+    }
+    
+    const int total_expert_tokens = expert_starts[num_experts];
+    token_map.resize(total_expert_tokens);
+    scatter_map.resize(num_tokens * top_k);
+    
+    // Create the gather map (token_map) and the scatter map
+    // `current_expert_counts` tracks the current position within each expert's batch.
+    std::vector<int> current_expert_counts(num_experts, 0);
+    for (int t = 0; t < num_tokens; ++t) {
+        for (int k = 0; k < top_k; ++k) {
+            int expert_id = selected_experts[t * top_k + k];
+            if (expert_id >= 0 && expert_id < num_experts) {
+                int pos_in_gathered_tensor = expert_starts[expert_id] + current_expert_counts[expert_id]++;
+                // gather map: stores original token info at the gathered position
+                token_map[pos_in_gathered_tensor] = {t, k};
+                // scatter map: stores the gathered position for the original token
+                scatter_map[t * top_k + k] = pos_in_gathered_tensor;
+            } else {
+                scatter_map[t * top_k + k] = -1; // Mark invalid experts
+            }
+        }
+    }
+}
+
+
+// A specialized SiLU activation function for MoE.
+// x = gate_proj(x), y = up_proj(x)
+// return silu(x) * y
+using Vec = at::vec::Vectorized<float>;
+
+static void silu_and_mul(float* C, int num_tokens, int intermediate_size) {
+    const int size_div_2 = intermediate_size / 2;
+    at::parallel_for(0, num_tokens, 0, [&](int64_t start, int64_t end) {
+        for (int64_t i = start; i < end; ++i) {
+            float* row = C + i * intermediate_size;
+            float* gate_part = row;
+            float* up_part = row + size_div_2;
+            
+            int j = 0;
+            // 1. Vectorized 主循环
+            // 每次处理 Vec::size() 个 float 元素
+            for (; j + Vec::size() <= size_div_2; j += Vec::size()) {
+                // 从内存加载数据到向量寄存器
+                Vec gate_vec = Vec::loadu(gate_part + j);
+                Vec up_vec = Vec::loadu(up_part + j);
+
+                const Vec one_vec(1.0f);
+                Vec activation_vec = gate_vec / (one_vec + (-gate_vec).exp());
+                Vec result_vec = up_vec * activation_vec;
+
+                result_vec.store(row + j);
+            }
+
+            // 2. Scalar 收尾循环
+            // 处理剩余不足一个向量长度的元素
+            for (; j < size_div_2; ++j) {
+                float gate_val = gate_part[j];
+                // SiLU (Swish) 激活函数: x * sigmoid(x)
+                float activation = gate_val / (1.0f + expf(-gate_val));
+                row[j] = up_part[j] * activation;
+            }
+        }
+    });
+}
+
+torch::Tensor moe_q8_forward(
+    torch::Tensor x,
+    torch::Tensor routing_weights,
+    torch::Tensor selected_experts,
+    torch::Tensor gate_up_qs_stacked,
+    torch::Tensor gate_up_d_stacked,
+    torch::Tensor down_proj_qs_stacked,
+    torch::Tensor down_proj_d_stacked
+) {
+    const auto num_tokens = x.size(0);
+    const auto hidden_dim = x.size(1);
+    const auto num_experts = gate_up_qs_stacked.size(0);
+    const auto intermediate_size_x2 = gate_up_qs_stacked.size(1);
+    const auto intermediate_size = down_proj_qs_stacked.size(2);
+    const auto top_k = selected_experts.size(1);
+
+    auto final_output = torch::zeros_like(x);
+
+    std::vector<int> expert_counts(num_experts, 0);
+    std::vector<int> expert_starts(num_experts + 1, 0);
+    std::vector<MoETokenInfo> token_map;
+    std::vector<int32_t> scatter_map;
+
+    preprocess_moe_routing(
+        num_experts, top_k, num_tokens, selected_experts.data_ptr<int32_t>(),
+        expert_counts, expert_starts, token_map, scatter_map
+    );
+
+    const int total_expert_tokens = expert_starts[num_experts];
+    if (total_expert_tokens == 0) {
+        return final_output;
+    }
+    
+    auto gathered_x = torch::empty({total_expert_tokens, hidden_dim}, torch::kFloat);
+    auto intermediate_act1 = torch::empty({total_expert_tokens, intermediate_size_x2}, torch::kFloat);
+    auto intermediate_act2 = torch::empty({total_expert_tokens, hidden_dim}, torch::kFloat);
+
+    float* gathered_x_ptr = gathered_x.data_ptr<float>();
+    const float* x_ptr = x.data_ptr<float>();
+
+    // Parallel Gather
+    at::parallel_for(0, total_expert_tokens, 0, [&](int64_t start, int64_t end) {
+        for (int64_t i = start; i < end; ++i) {
+            memcpy(gathered_x_ptr + i * hidden_dim, x_ptr + token_map[i].token_id * hidden_dim, hidden_dim * sizeof(float));
+        }
+    });
+
+    // Parallel computation for each expert
+    at::parallel_for(0, num_experts, 0, [&](int64_t start, int64_t end) {
+        // ... (This block of expert computation remains unchanged) ...
+        for (int64_t exp_id = start; exp_id < end; ++exp_id) {
+            int count = expert_counts[exp_id];
+            if (count == 0) continue;
+            int start_pos = expert_starts[exp_id];
+
+            auto expert_gathered_x = gathered_x.slice(0, start_pos, start_pos + count);
+            auto expert_intermediate1 = intermediate_act1.slice(0, start_pos, start_pos + count);
+            auto expert_intermediate2 = intermediate_act2.slice(0, start_pos, start_pos + count);
+            
+            // GEMM 1: gate_up_proj
+            gemm_q8_0_aten_parallel_packed(
+                count, intermediate_size_x2, hidden_dim,
+                expert_gathered_x.data_ptr<float>(), hidden_dim,
+                gate_up_qs_stacked[exp_id].data_ptr<int8_t>(),
+                reinterpret_cast<const ggml_half*>(gate_up_d_stacked[exp_id].data_ptr<at::Half>()),
+                expert_intermediate1.data_ptr<float>()
+            );
+
+            // Activation
+            silu_and_mul(expert_intermediate1.data_ptr<float>(), count, intermediate_size_x2);
+
+            // GEMM 2: down_proj
+            gemm_q8_0_aten_parallel_packed(
+                count, hidden_dim, intermediate_size,
+                expert_intermediate1.data_ptr<float>(), intermediate_size_x2,  
+                down_proj_qs_stacked[exp_id].data_ptr<int8_t>(),
+                reinterpret_cast<const ggml_half*>(down_proj_d_stacked[exp_id].data_ptr<at::Half>()),
+                expert_intermediate2.data_ptr<float>()
+            );
+        }
+    });
+
+    float* final_output_ptr = final_output.data_ptr<float>();
+    const float* routing_weights_ptr = routing_weights.data_ptr<float>();
+    const float* intermediate_act2_ptr = intermediate_act2.data_ptr<float>();
+
+    // Token-centric Parallel Aggregation (Scatter) - No atomics needed
+    at::parallel_for(0, num_tokens, 0, [&](int64_t start, int64_t end) {
+        std::vector<float> acc_buffer(hidden_dim, 0.0f);
+        for (int64_t t = start; t < end; ++t) {
+            std::fill(acc_buffer.begin(), acc_buffer.end(), 0.0f);
+            for (int k = 0; k < top_k; ++k) {
+                const int scatter_idx = t * top_k + k;
+                const int src_row_idx = scatter_map[scatter_idx];
+                if (src_row_idx == -1) continue;
+
+                const float weight = routing_weights_ptr[scatter_idx];
+                const float* src_row = intermediate_act2_ptr + src_row_idx * hidden_dim;
+
+                // Accumulate weighted results
+                for (int j = 0; j < hidden_dim; ++j) {
+                    acc_buffer[j] += weight * src_row[j];
+                }
+            }
+            // Copy final result to output tensor
+            memcpy(final_output_ptr + t * hidden_dim, acc_buffer.data(), hidden_dim * sizeof(float));
+        }
+    });
+    
+    return final_output;
+}
+
+// ... (Rest of the file and PYBIND11_MODULE block remains the same) ...
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("quantize_repack_weight", &quantize_repack_weight, "Quantize and repack weight for q8_gemm");
     m.def("q8_gemm", &q8_gemm, "q8_gemm kernel (A_fp32 @ B_q8.T)");
+    m.def("moe_q8_forward", &moe_q8_forward, "Full MoE expert forward pass with int8 GEMM on CPU");
 }
