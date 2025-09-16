@@ -7,10 +7,11 @@ from multiprocessing.shared_memory import SharedMemory
 from nanovllm.config import Config
 from nanovllm.engine.sequence import Sequence
 from nanovllm.models.qwen3 import Qwen3ForCausalLM
+from nanovllm.models.olmoe import OlmoeForCausalLM
 from nanovllm.layers.sampler import Sampler
 from nanovllm.utils.context import set_context, get_context, reset_context
 from nanovllm.utils.loader import load_model
-from nanovllm.utils.quantize import quantize_and_replace_mlp
+from nanovllm.utils.quantize import quantize_and_replace_mlp, quantize_and_replace_moe_mlp
 
 class ModelRunner:
 
@@ -28,11 +29,22 @@ class ModelRunner:
         default_dtype = torch.get_default_dtype()
         torch.set_default_dtype(hf_config.torch_dtype)
         torch.set_default_device("cuda")
-        self.model = Qwen3ForCausalLM(hf_config)
+
+        if hf_config.model_type == "olmoe":
+            self.model = OlmoeForCausalLM(hf_config)
+            print("Using OlmoeForCausalLM model.")
+        elif "qwen" in hf_config.model_type:
+            self.model = Qwen3ForCausalLM(hf_config)
+            print("Using Qwen3ForCausalLM model.")
+        else:
+            raise ValueError(f"Unsupported model type: {hf_config.model_type}")
+
         load_model(self.model, config.model)
 
-        quantize_and_replace_mlp(self.model)
-
+        if hf_config.model_type == "olmoe":
+            quantize_and_replace_moe_mlp(self.model)
+        elif "qwen" in hf_config.model_type:
+            quantize_and_replace_mlp(self.model)
 
         self.sampler = Sampler()
         self.warmup_model()
@@ -109,10 +121,17 @@ class ModelRunner:
         peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
         current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
         num_kv_heads = hf_config.num_key_value_heads // self.world_size
-        block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * hf_config.head_dim * hf_config.torch_dtype.itemsize
+
+        # Calculate head_dim if it's not explicitly in the config (e.g., for Olmoe)
+        if hasattr(hf_config, 'head_dim') and hf_config.head_dim is not None:
+            head_dim = hf_config.head_dim
+        else:
+            head_dim = hf_config.hidden_size // hf_config.num_attention_heads
+
+        block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * head_dim * hf_config.torch_dtype.itemsize
         config.num_kvcache_blocks = int(total * config.gpu_memory_utilization - used - peak + current) // block_bytes
         assert config.num_kvcache_blocks > 0
-        self.kv_cache = torch.empty(2, hf_config.num_hidden_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads, hf_config.head_dim)
+        self.kv_cache = torch.empty(2, hf_config.num_hidden_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads, head_dim)
         layer_id = 0
         for module in self.model.modules():
             if hasattr(module, "k_cache") and hasattr(module, "v_cache"):
