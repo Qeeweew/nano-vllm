@@ -6,7 +6,7 @@ import nanovllm_ext  # This will be built by setup.py
 
 class QuantizedLinear(nn.Module):
     """
-    A quantized linear layer for CPU execution, using a custom int8 GEMM kernel.
+    A quantized linear layer for CPU execution, using a custom FP32 x int8 -> FP32 GEMM kernel.
     The weight is quantized and repacked offline.
     """
     def __init__(self, input_size: int, output_size: int, bias: bool = False):
@@ -50,13 +50,9 @@ class QuantizedLinear(nn.Module):
             raise RuntimeError("Linear layer has not been quantized. Call .quantize(weight) first.")
 
         # Store original dtype and shape to restore them later.
-        orig_dtype = x.dtype
+        assert x.dtype == torch.float32
         orig_shape = x.shape
 
-        # The C++ kernel expects a float32 input. Convert if necessary.
-        if x.dtype != torch.float32:
-            x = x.to(torch.float32)
-        
         # The GEMM kernel expects a 2D input
         x_reshaped = x.view(-1, self.input_size)
         
@@ -64,12 +60,11 @@ class QuantizedLinear(nn.Module):
         y = nanovllm_ext.q8_gemm(x_reshaped, self.weight_qs, self.weight_d)
         
         # Reshape the output to match the input batch dimensions
-        y = y.view(*orig_shape[:-1], self.output_size).to(orig_dtype)
+        y = y.view(*orig_shape[:-1], self.output_size)
 
         if self.bias is not None:
-            y += self.bias
+            y += self.bias.to(torch.float32)
         
-        # Convert the float32 result back to the original dtype (e.g., bfloat16).
         return y
 
     def extra_repr(self) -> str:

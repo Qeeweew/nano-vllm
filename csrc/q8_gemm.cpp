@@ -448,7 +448,7 @@ std::vector<torch::Tensor> quantize_repack_weight(torch::Tensor B_float) {
     
     const auto N = B_float.size(0);
     const auto K = B_float.size(1);
-    printf("N = %d K = %d\n", N, K);
+    // printf("N = %d K = %d\n", N, K);
     
     TORCH_CHECK(K % QK8_0 == 0, "Weight's K dimension must be a multiple of ", QK8_0);
 

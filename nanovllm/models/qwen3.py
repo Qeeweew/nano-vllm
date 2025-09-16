@@ -104,10 +104,13 @@ class Qwen3MLP(nn.Module):
         assert hidden_act == "silu"
         self.act_fn = SiluAndMul()
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor):
         orig_device = x.device
         # 将输入张量从GPU移动到CPU
         x_cpu = x.to("cpu")
+        origin_type = x_cpu.dtype
+        if origin_type != torch.float32:
+            x_cpu = x_cpu.to(torch.float32)
 
         # 在CPU上执行MLP计算
         gate_up = self.gate_up_proj(x_cpu)
@@ -115,8 +118,10 @@ class Qwen3MLP(nn.Module):
         x_cpu = self.down_proj(x_cpu)
 
         # 将结果张量移回原始GPU设备
-        return x_cpu.to(orig_device)
+        if origin_type != torch.float32:
+            x_cpu = x_cpu.to(origin_type)
 
+        return x_cpu.to(orig_device)
 
 
 class Qwen3DecoderLayer(nn.Module):
