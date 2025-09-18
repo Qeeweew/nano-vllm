@@ -150,10 +150,10 @@ class OlmoeSparseMoeBlock(nn.Module):
 
         if self.norm_top_k_prob:
             routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
-
+        
         # === 2. Transfer Data to CPU ===
-        hidden_states_cpu = hidden_states.to(device="cpu", dtype=torch.float32)
-        routing_weights_cpu = routing_weights.to(device="cpu")
+        hidden_states_cpu = hidden_states.to(device="cpu")
+        routing_weights_cpu = routing_weights.to(device="cpu", dtype=orig_dtype)
         selected_experts_cpu = selected_experts.to(device="cpu", dtype=torch.int32)
 
         # === 3. CPU Part: Expert Computation via C++ Kernel ===
@@ -168,7 +168,7 @@ class OlmoeSparseMoeBlock(nn.Module):
         )
         
         # === 4. Transfer Result back to GPU ===
-        return final_hidden_states_cpu.to(device=orig_device, dtype=orig_dtype)
+        return final_hidden_states_cpu.to(device=orig_device, non_blocking=True)
 
 class OlmoeDecoderLayer(nn.Module):
     def __init__(self, config: OlmoeConfig) -> None:
