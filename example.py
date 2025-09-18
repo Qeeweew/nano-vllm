@@ -11,7 +11,7 @@ def main():
     # tokenizer = AutoTokenizer.from_pretrained(path)
     llm = LLM(path, enforce_eager=True, tensor_parallel_size=1)
 
-    sampling_params = SamplingParams(temperature=0, max_tokens=16)
+    sampling_params = SamplingParams(temperature=0, max_tokens=4)
     prompts = [
         "Bitcoin is",
     ]
@@ -29,28 +29,39 @@ def main():
     print("Warm-up finished. Starting profiling...")
     
     # 创建 profiler 上下文
-    with profile(
-        activities=[ProfilerActivity.CPU, ProfilerActivity.NPU], # 同时记录 CPU 和 GPU
-        record_shapes=True,        # 记录张量的形状
-        profile_memory=True,       # 记录内存分配/释放
-        with_stack=True,           # 记录Python调用堆栈，方便溯源
-        on_trace_ready=torch_npu.profiler.tensorboard_trace_handler('./prof_log') # 将结果保存到目录
-    ) as prof:
-        # 在这里执行你想要分析的代码
-        outputs = llm.generate(prompts, sampling_params)
+    # experimental_config = torch_npu.profiler._ExperimentalConfig(
+	#     export_type=torch_npu.profiler.ExportType.Text,
+	#     profiler_level=torch_npu.profiler.ProfilerLevel.Level0,
+	#     msprof_tx=False,
+	#     aic_metrics=torch_npu.profiler.AiCMetrics.AiCoreNone,
+	#     l2_cache=False,
+	#     op_attr=False,
+	#     data_simplification=False,
+	#     record_op_args=False
+    # )
+
+    # with torch_npu.profiler.profile(
+    #         activities=[
+    #                 torch_npu.profiler.ProfilerActivity.CPU,
+    #                 torch_npu.profiler.ProfilerActivity.NPU
+    #                 ],
+    #         schedule=torch_npu.profiler.schedule(wait=0, warmup=0, active=1, repeat=1, skip_first=0),
+    #         on_trace_ready=torch_npu.profiler.tensorboard_trace_handler("./prof_log"),
+    #         record_shapes=True,
+    #         profile_memory=False,
+    #         with_stack=True,
+    #         with_modules=True,
+    #         with_flops=False,
+    #         experimental_config=experimental_config) as prof:
+    #         outputs = llm.generate(prompts, sampling_params)
+    #         prof.step()
+
 
     # --- Profiling部分结束 ---
 
     # 打印 profiler 总结信息到控制台
-    # print("\n--- Profiler Summary (CPU+CUDA) ---")
-    # print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=15))
-    
-    # print("\n--- Profiler Summary (CPU) ---")
-    # print(prof.key_averages().table(sort_by="cpu_time_total", row_limit=15))
 
-    # print(f"\nProfiling results saved to ./prof_log. Run 'tensorboard --logdir ./prof_log' to view.")
-
-    # outputs = llm.generate(prompts, sampling_params)
+    outputs = llm.generate(prompts, sampling_params)
 
     # 打印正常输出
     for prompt, output in zip(prompts, outputs):

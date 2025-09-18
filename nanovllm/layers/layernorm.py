@@ -1,5 +1,6 @@
 import torch
 from torch import nn
+import torch_npu
 
 
 class RMSNorm(nn.Module):
@@ -44,7 +45,8 @@ class RMSNorm(nn.Module):
         x: torch.Tensor,
         residual: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        if residual is None:
-            return self.rms_forward(x)
-        else:
-            return self.add_rms_forward(x, residual)
+        if residual is not None:
+            x, _, residual = torch_npu.npu_add_rms_norm(x, residual, self.weight, self.eps)
+            return x, residual
+        x, _ = torch_npu.npu_rms_norm(x, self.weight, self.eps)
+        return x

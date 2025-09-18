@@ -30,12 +30,6 @@
     using ggml_half = uint16_t;
     #define GGML_CPU_FP32_TO_FP16(x) _cvtss_sh(x, 0)
     #define GGML_CPU_FP16_TO_FP32(x) _cvtsh_ss(x)
-#else
-    using ggml_half = uint16_t;
-    static inline uint16_t float_to_half_bits(float f) { union { float f; uint32_t u; } x = {f}; uint32_t u = x.u; uint32_t sign = (u >> 31) & 0x1; uint32_t exp = (u >> 23) & 0xff; uint32_t frac = u & 0x7fffff; if (exp == 0xff) { return (sign << 15) | 0x7c00 | (frac ? 0x200 : 0); } if (exp <= 127 - 15) { return (sign << 15); } int new_exp = exp - 127 + 15; if (new_exp >= 31) { return (sign << 15) | 0x7c00; } return (sign << 15) | (new_exp << 10) | (frac >> 13); }
-    static inline float half_bits_to_float(uint16_t h) { uint32_t sign = (h >> 15) & 0x1; uint32_t exp = (h >> 10) & 0x1f; uint32_t frac = h & 0x3ff; if (exp == 0x1f) { return frac ? NAN : (sign ? -INFINITY : INFINITY); } float val; if (exp == 0) { val = std::ldexp(static_cast<float>(frac), -24); } else { val = std::ldexp(static_cast<float>(frac | 0x400), exp - 15 - 10); } return sign ? -val : val; }
-    #define GGML_CPU_FP32_TO_FP16(x) float_to_half_bits(x)
-    #define GGML_CPU_FP16_TO_FP32(x) half_bits_to_float(x)
 #endif
 
 typedef struct {
@@ -49,11 +43,7 @@ typedef struct {
 #elif defined(__AVX2__)
 #define MR 8
 #define NR 8
-#else
-#define MR 1
-#define NR 1
 #endif
-
 
 template<typename D_TYPE>
 static inline void quantize_block_q8_0(const float *x, D_TYPE* y_d, int8_t* y_qs) {
@@ -602,7 +592,8 @@ static void silu_and_mul(float* C, int num_tokens, int intermediate_size) {
     });
 }
 
-torch::Tensor moe_q8_forward(
+template <typename T>
+torch::Tensor moe_q8_forward_impl(
     torch::Tensor x,
     torch::Tensor routing_weights,
     torch::Tensor selected_experts,
@@ -618,7 +609,8 @@ torch::Tensor moe_q8_forward(
     const auto intermediate_size = down_proj_qs_stacked.size(2);
     const auto top_k = selected_experts.size(1);
 
-    auto final_output = torch::zeros_like(x);
+    // final_output 将具有与输入x相同的dtype
+    auto final_output = torch::empty_like(x);
 
     std::vector<int> expert_counts(num_experts, 0);
     std::vector<int> expert_starts(num_experts + 1, 0);
@@ -631,21 +623,23 @@ torch::Tensor moe_q8_forward(
     );
 
     const int total_expert_tokens = expert_starts[num_experts];
-    if (total_expert_tokens == 0) {
-        return final_output;
-    }
     
+    // 中间计算统一使用 float32 以保证精度
     auto gathered_x = torch::empty({total_expert_tokens, hidden_dim}, torch::kFloat);
-    auto intermediate_act1 = torch::empty({total_expert_tokens, intermediate_size_x2}, torch::kFloat);
+    auto expert_intermediate1 = torch::empty({num_tokens, intermediate_size_x2}, torch::kFloat); // 优化内存
     auto intermediate_act2 = torch::empty({total_expert_tokens, hidden_dim}, torch::kFloat);
 
     float* gathered_x_ptr = gathered_x.data_ptr<float>();
-    const float* x_ptr = x.data_ptr<float>();
+    const T* x_ptr = x.data_ptr<T>();
 
-    // Parallel Gather
+    // Parallel Gather: 从 T 转换为 float
     at::parallel_for(0, total_expert_tokens, 0, [&](int64_t start, int64_t end) {
         for (int64_t i = start; i < end; ++i) {
-            memcpy(gathered_x_ptr + i * hidden_dim, x_ptr + token_map[i].token_id * hidden_dim, hidden_dim * sizeof(float));
+            const T* src_ptr = x_ptr + token_map[i].token_id * hidden_dim;
+            float* dst_ptr = gathered_x_ptr + i * hidden_dim;
+            for (int j = 0; j < hidden_dim; ++j) {
+                dst_ptr[j] = static_cast<float>(src_ptr[j]);
+            }
         }
     });
 
@@ -655,7 +649,6 @@ torch::Tensor moe_q8_forward(
         int start_pos = expert_starts[exp_id];
 
         auto expert_gathered_x = gathered_x.slice(0, start_pos, start_pos + count);
-        auto expert_intermediate1 = intermediate_act1.slice(0, start_pos, start_pos + count);
         auto expert_intermediate2 = intermediate_act2.slice(0, start_pos, start_pos + count);
             
         // GEMM 1: gate_up_proj
@@ -680,11 +673,11 @@ torch::Tensor moe_q8_forward(
         );
     }
 
-    float* final_output_ptr = final_output.data_ptr<float>();
-    const float* routing_weights_ptr = routing_weights.data_ptr<float>();
+    T* final_output_ptr = final_output.data_ptr<T>();
+    const T* routing_weights_ptr = routing_weights.data_ptr<T>();
     const float* intermediate_act2_ptr = intermediate_act2.data_ptr<float>();
 
-    // Token-centric Parallel Aggregation (Scatter) - No atomics needed
+    // Token-centric Parallel Aggregation (Scatter): 从 float 转换回 T
     at::parallel_for(0, num_tokens, 0, [&](int64_t start, int64_t end) {
         std::vector<float> acc_buffer(hidden_dim, 0.0f);
         for (int64_t t = start; t < end; ++t) {
@@ -694,26 +687,61 @@ torch::Tensor moe_q8_forward(
                 const int src_row_idx = scatter_map[scatter_idx];
                 if (src_row_idx == -1) continue;
 
-                const float weight = routing_weights_ptr[scatter_idx];
+                // 从 T 转换为 float 来计算
+                const float weight = static_cast<float>(routing_weights_ptr[scatter_idx]);
                 const float* src_row = intermediate_act2_ptr + src_row_idx * hidden_dim;
 
-                // Accumulate weighted results
+                // 在 float32 累加
                 for (int j = 0; j < hidden_dim; ++j) {
                     acc_buffer[j] += weight * src_row[j];
                 }
             }
-            // Copy final result to output tensor
-            memcpy(final_output_ptr + t * hidden_dim, acc_buffer.data(), hidden_dim * sizeof(float));
+            // 将累加结果从 float 转换回 T 并写入输出张量
+            T* dst_row = final_output_ptr + t * hidden_dim;
+            const float* src_row_acc = acc_buffer.data();
+            for (int j = 0; j < hidden_dim; ++j) {
+                dst_row[j] = static_cast<T>(src_row_acc[j]);
+            }
         }
     });
     
     return final_output;
 }
 
-// ... (Rest of the file and PYBIND11_MODULE block remains the same) ...
+// 调度器函数，Pybind将绑定到此函数
+torch::Tensor moe_q8_forward(
+    torch::Tensor x,
+    torch::Tensor routing_weights,
+    torch::Tensor selected_experts,
+    torch::Tensor gate_up_qs_stacked,
+    torch::Tensor gate_up_d_stacked,
+    torch::Tensor down_proj_qs_stacked,
+    torch::Tensor down_proj_d_stacked
+) {
+    // 检查输入和权重是否具有相同的dtype
+    TORCH_CHECK(x.scalar_type() == routing_weights.scalar_type(), 
+                "x and routing_weights must have the same dtype");
+    
+    // 根据输入类型调用相应的模板实例
+    if (x.scalar_type() == torch::kFloat) {
+        return moe_q8_forward_impl<float>(
+            x, routing_weights, selected_experts, gate_up_qs_stacked,
+            gate_up_d_stacked, down_proj_qs_stacked, down_proj_d_stacked);
+    } else if (x.scalar_type() == torch::kBFloat16) {
+        return moe_q8_forward_impl<at::BFloat16>(
+            x, routing_weights, selected_experts, gate_up_qs_stacked,
+            gate_up_d_stacked, down_proj_qs_stacked, down_proj_d_stacked);
+    } else if (x.scalar_type() == torch::kHalf) {
+        return moe_q8_forward_impl<at::Half>(
+            x, routing_weights, selected_experts, gate_up_qs_stacked,
+            gate_up_d_stacked, down_proj_qs_stacked, down_proj_d_stacked);
+    } else {
+        TORCH_CHECK(false, "Unsupported input dtype for moe_q8_forward. Supported dtypes are float32, bfloat16, and float16.");
+    }
+}
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("quantize_repack_weight", &quantize_repack_weight, "Quantize and repack weight for q8_gemm");
     m.def("q8_gemm", &q8_gemm, "q8_gemm kernel (A_fp32 @ B_q8.T)");
-    m.def("moe_q8_forward", &moe_q8_forward, "Full MoE expert forward pass with int8 GEMM on CPU");
+    m.def("moe_q8_forward", &moe_q8_forward, "Full MoE expert forward pass with int8 GEMM on CPU for float, bfloat16, and float16 inputs");
 }

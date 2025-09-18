@@ -1,42 +1,43 @@
 import torch
 from torch import nn
 import torch.nn.functional as F
+import triton
+import triton.language as tl
 
 from nanovllm.utils.context import get_context
+import torch_npu
+
+@triton.jit
+def store_kvcache_kernel(
+    key_ptr,
+    key_stride,
+    value_ptr,
+    value_stride,
+    k_cache_ptr,
+    v_cache_ptr,
+    slot_mapping_ptr,
+    D: tl.constexpr,
+):
+    idx = tl.program_id(0)
+    slot = tl.load(slot_mapping_ptr + idx)
+    if slot == -1: return
+    key_offsets = idx * key_stride + tl.arange(0, D)
+    value_offsets = idx * value_stride + tl.arange(0, D)
+    key = tl.load(key_ptr + key_offsets)
+    value = tl.load(value_ptr + value_offsets)
+    cache_offsets = slot * D + tl.arange(0, D)
+    tl.store(k_cache_ptr + cache_offsets, key)
+    tl.store(v_cache_ptr + cache_offsets, value)
 
 
 def store_kvcache(key: torch.Tensor, value: torch.Tensor, k_cache: torch.Tensor, v_cache: torch.Tensor, slot_mapping: torch.Tensor):
-    """
-    使用PyTorch将key和value张量存储到分页的KV缓存中。
-    这是一个用于替代Triton内核的实现。
-
-    Args:
-        key: (num_tokens, num_kv_heads, head_dim)
-        value: (num_tokens, num_kv_heads, head_dim)
-        k_cache: (num_blocks, block_size, num_kv_heads, head_dim)
-        v_cache: (num_blocks, block_size, num_kv_heads, head_dim)
-        slot_mapping: (num_tokens,) 每个token对应的线性插槽索引。
-    """
-    block_size = k_cache.shape[1]
-
-    # 找到有效的插槽（-1表示padding，需要忽略）
-    valid_mask = slot_mapping != -1
-    if not torch.any(valid_mask):
-        return
-
-    valid_slots = slot_mapping[valid_mask]
-    # 只选择与有效插槽对应的键/值
-    valid_key = key[valid_mask]
-    valid_value = value[valid_mask]
-
-    # 将线性插槽索引转换为(块索引, 块内偏移)
-    block_indices = torch.div(valid_slots, block_size, rounding_mode='floor')
-    block_offsets = valid_slots % block_size
-
-    # 使用高级索引将键和值分散存储到缓存中
-    k_cache[block_indices, block_offsets] = valid_key
-    v_cache[block_indices, block_offsets] = valid_value
-
+    N, num_heads, head_dim = key.shape
+    D = num_heads * head_dim
+    assert key.stride(-1) == 1 and value.stride(-1) == 1
+    assert key.stride(1) == head_dim and value.stride(1) == head_dim
+    assert k_cache.stride(1) == D and v_cache.stride(1) == D
+    assert slot_mapping.numel() == N
+    store_kvcache_kernel[(N,)](key, key.stride(0), value, value.stride(0), k_cache, v_cache, slot_mapping, D)
 
 class Attention(nn.Module):
 
@@ -52,7 +53,6 @@ class Attention(nn.Module):
         self.head_dim = head_dim
         self.scale = scale
         self.num_kv_heads = num_kv_heads
-        # 如果查询头的数量与键/值头的数量不同，则启用GQA
         self.k_cache = self.v_cache = torch.tensor([])
         if self.num_heads != self.num_kv_heads:
             assert self.num_heads % self.num_kv_heads == 0, "对于GQA，num_heads必须能被num_kv_heads整除"
@@ -124,50 +124,17 @@ class Attention(nn.Module):
             o = torch.cat(outputs, dim=0) if outputs else torch.empty_like(q)
 
         else:    # Decode阶段：为每个序列生成一个token
-            # q shape: (batch_size, num_heads, head_dim)
-            batch_size = q.shape[0]
-
-            # 准备query用于批处理：(B, H, 1, D)
-            q = q.unsqueeze(2)
-
-            # 从分页缓存中收集K和V，并填充到最大长度以进行单次批处理调用
-            max_seqlen = torch.max(context.context_lens).item()
-            k_padded = torch.zeros(batch_size, max_seqlen, self.num_kv_heads, self.head_dim, dtype=q.dtype, device=q.device)
-            v_padded = torch.zeros(batch_size, max_seqlen, self.num_kv_heads, self.head_dim, dtype=q.dtype, device=q.device)
-            
-            for i in range(batch_size):
-                seqlen_k_i = context.context_lens[i].item()
-                block_table_i = context.block_tables[i]
-                valid_blocks = block_table_i[block_table_i != -1]
-                
-                k_i = k_cache[valid_blocks].reshape(-1, self.num_kv_heads, self.head_dim)[:seqlen_k_i]
-                v_i = v_cache[valid_blocks].reshape(-1, self.num_kv_heads, self.head_dim)[:seqlen_k_i]
-                
-                k_padded[i, :seqlen_k_i] = k_i
-                v_padded[i, :seqlen_k_i] = v_i
-
-            # 为sdpa格式进行转置：(B, H, L, D)
-            k_padded = k_padded.transpose(1, 2)
-            v_padded = v_padded.transpose(1, 2)
-            
-            # 创建注意力掩码以忽略k/v中的填充部分
-            # 掩码应可广播至(B, H, 1, max_seqlen)
-            attn_mask = (torch.arange(max_seqlen, device=q.device)[None, :] < context.context_lens[:, None]).to(torch.bool)
-
-            # --- FIX STARTS HERE ---
-            # 原始掩码形状为 (B, S)，需要调整为 (B, 1, 1, S) 以正确广播
-            attn_mask = attn_mask.unsqueeze(1).unsqueeze(2)
-            # --- FIX ENDS HERE ---
-
-            o = F.scaled_dot_product_attention(
-                q, k_padded, v_padded,
-                attn_mask=attn_mask,
-                scale=self.scale,
-                is_causal=False, # Decode时q长度为1，非因果
-                enable_gqa=self.enable_gqa
-            ) # 输出 shape: (B, num_heads, 1, head_dim)
-            
-            # 重塑输出为 (batch_size, num_heads, head_dim)
-            o = o.squeeze(2)
-        
+            o = torch.empty_like(q)
+            # 调用高性能的 _npu_paged_attention 算子
+            torch_npu._npu_paged_attention(
+                q,                      # query: (bs, num_heads, head_dim)
+                self.k_cache,           # key_cache: (num_blocks, block_size, num_kv_heads, head_dim)
+                self.v_cache,           # value_cache: (num_blocks, block_size, num_kv_heads, head_dim)
+                self.num_kv_heads,      # kv_heads (int)
+                self.num_heads,         # num_heads (int)
+                self.scale,             # scale (float)
+                context.block_tables,   # block_tables: (bs, max_blocks_per_seq)
+                context.context_lens,   # context_lens: (bs,)，必须在 CPU 上
+                o                       # output: (bs, num_heads, head_dim)
+            )        
         return o

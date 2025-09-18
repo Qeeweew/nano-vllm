@@ -107,6 +107,7 @@ class OlmoeMLP(nn.Module):
         return x
 
 import nanovllm_ext
+import torch_npu
 
 class OlmoeSparseMoeBlock(nn.Module):
     """
@@ -141,20 +142,15 @@ class OlmoeSparseMoeBlock(nn.Module):
             raise ValueError(f"OlmoeSparseMoeBlock expects a 2D input, but got shape {hidden_states.shape}")
 
         orig_device = hidden_states.device
-        orig_dtype = hidden_states.dtype
         
         # === 1. GPU Part: Routing ===
         router_logits = self.gate(hidden_states)
-        routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
-        routing_weights, selected_experts = torch.topk(routing_weights, self.top_k, dim=-1)
-
-        if self.norm_top_k_prob:
-            routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
+        routing_weights, selected_experts, _ = torch_npu.npu_moe_gating_top_k_softmax(router_logits, None, self.top_k)
 
         # === 2. Transfer Data to CPU ===
-        hidden_states_cpu = hidden_states.to(device="cpu", dtype=torch.float32)
+        hidden_states_cpu = hidden_states.to(device="cpu")
         routing_weights_cpu = routing_weights.to(device="cpu")
-        selected_experts_cpu = selected_experts.to(device="cpu", dtype=torch.int32)
+        selected_experts_cpu = selected_experts.to(device="cpu")
 
         # === 3. CPU Part: Expert Computation via C++ Kernel ===
         final_hidden_states_cpu = nanovllm_ext.moe_q8_forward(
@@ -168,7 +164,7 @@ class OlmoeSparseMoeBlock(nn.Module):
         )
         
         # === 4. Transfer Result back to GPU ===
-        return final_hidden_states_cpu.to(device=orig_device, dtype=orig_dtype)
+        return final_hidden_states_cpu.to(device=orig_device, non_blocking=True)
 
 class OlmoeDecoderLayer(nn.Module):
     def __init__(self, config: OlmoeConfig) -> None:

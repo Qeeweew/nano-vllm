@@ -61,7 +61,7 @@ class ModelRunner:
         # if not self.enforce_eager:
         #     self.capture_cudagraph()
 
-        torch.set_default_device("cpu")
+        # torch.set_default_device("cpu")
         torch.set_default_dtype(default_dtype)
 
         if self.world_size > 1:
@@ -137,7 +137,7 @@ class ModelRunner:
         # Heuristic approach: Reserve a fixed buffer for activations and temporary tensors.
         # This value may need tuning depending on the model and max batch size.
         # 2 GB is a reasonable starting point for models around 7B.
-        activation_memory_buffer_gb = 2.0
+        activation_memory_buffer_gb = 20.0
         activation_memory_buffer_bytes = int(activation_memory_buffer_gb * (1024**3))
         
         print(f"[KV Cache] Total GPU memory: {total/1e9:.2f} GB")
@@ -233,7 +233,7 @@ class ModelRunner:
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).npu(non_blocking=True)
         positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).npu(non_blocking=True)
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).npu(non_blocking=True)
-        context_lens = torch.tensor(context_lens, dtype=torch.int32, pin_memory=True).npu(non_blocking=True)
+        context_lens = torch.tensor(context_lens, dtype=torch.int32, device="cpu")
         block_tables = self.prepare_block_tables(seqs)
         set_context(False, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables)
         return input_ids, positions
