@@ -649,40 +649,36 @@ torch::Tensor moe_q8_forward(
         }
     });
 
-    // Parallel computation for each expert
-    at::parallel_for(0, num_experts, 0, [&](int64_t start, int64_t end) {
-        // ... (This block of expert computation remains unchanged) ...
-        for (int64_t exp_id = start; exp_id < end; ++exp_id) {
-            int count = expert_counts[exp_id];
-            if (count == 0) continue;
-            int start_pos = expert_starts[exp_id];
+    for (int64_t exp_id = 0; exp_id < num_experts; ++exp_id) {
+        int count = expert_counts[exp_id];
+        if (count == 0) continue;
+        int start_pos = expert_starts[exp_id];
 
-            auto expert_gathered_x = gathered_x.slice(0, start_pos, start_pos + count);
-            auto expert_intermediate1 = intermediate_act1.slice(0, start_pos, start_pos + count);
-            auto expert_intermediate2 = intermediate_act2.slice(0, start_pos, start_pos + count);
+        auto expert_gathered_x = gathered_x.slice(0, start_pos, start_pos + count);
+        auto expert_intermediate1 = intermediate_act1.slice(0, start_pos, start_pos + count);
+        auto expert_intermediate2 = intermediate_act2.slice(0, start_pos, start_pos + count);
             
-            // GEMM 1: gate_up_proj
-            gemm_q8_0_aten_parallel_packed(
-                count, intermediate_size_x2, hidden_dim,
-                expert_gathered_x.data_ptr<float>(), hidden_dim,
-                gate_up_qs_stacked[exp_id].data_ptr<int8_t>(),
-                reinterpret_cast<const ggml_half*>(gate_up_d_stacked[exp_id].data_ptr<at::Half>()),
-                expert_intermediate1.data_ptr<float>()
-            );
+        // GEMM 1: gate_up_proj
+        gemm_q8_0_aten_parallel_packed(
+            count, intermediate_size_x2, hidden_dim,
+            expert_gathered_x.data_ptr<float>(), hidden_dim,
+            gate_up_qs_stacked[exp_id].data_ptr<int8_t>(),
+            reinterpret_cast<const ggml_half*>(gate_up_d_stacked[exp_id].data_ptr<at::Half>()),
+            expert_intermediate1.data_ptr<float>()
+        );
 
-            // Activation
-            silu_and_mul(expert_intermediate1.data_ptr<float>(), count, intermediate_size_x2);
+        // Activation
+        silu_and_mul(expert_intermediate1.data_ptr<float>(), count, intermediate_size_x2);
 
-            // GEMM 2: down_proj
-            gemm_q8_0_aten_parallel_packed(
-                count, hidden_dim, intermediate_size,
-                expert_intermediate1.data_ptr<float>(), intermediate_size_x2,  
-                down_proj_qs_stacked[exp_id].data_ptr<int8_t>(),
-                reinterpret_cast<const ggml_half*>(down_proj_d_stacked[exp_id].data_ptr<at::Half>()),
-                expert_intermediate2.data_ptr<float>()
-            );
-        }
-    });
+        // GEMM 2: down_proj
+        gemm_q8_0_aten_parallel_packed(
+            count, hidden_dim, intermediate_size,
+            expert_intermediate1.data_ptr<float>(), intermediate_size_x2,  
+            down_proj_qs_stacked[exp_id].data_ptr<int8_t>(),
+            reinterpret_cast<const ggml_half*>(down_proj_d_stacked[exp_id].data_ptr<at::Half>()),
+            expert_intermediate2.data_ptr<float>()
+        );
+    }
 
     float* final_output_ptr = final_output.data_ptr<float>();
     const float* routing_weights_ptr = routing_weights.data_ptr<float>();
