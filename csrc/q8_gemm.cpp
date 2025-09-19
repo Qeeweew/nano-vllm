@@ -1,4 +1,5 @@
 #include <torch/extension.h>
+#include <torch_npu/csrc/core/npu/NPUStream.h>
 #include <type_traits>
 #include <vector>
 #include <functional>
@@ -610,12 +611,14 @@ torch::Tensor moe_q8_forward_impl(
     const auto top_k = selected_experts.size(1);
 
     // final_output 将具有与输入x相同的dtype
-    auto final_output = torch::empty_like(x);
-
+    c10_npu::NPUStream stream = c10_npu::getCurrentNPUStream();
+    
     std::vector<int> expert_counts(num_experts, 0);
     std::vector<int> expert_starts(num_experts + 1, 0);
     std::vector<MoETokenInfo> token_map;
     std::vector<int32_t> scatter_map;
+   
+    stream.synchronize();
 
     preprocess_moe_routing(
         num_experts, top_k, num_tokens, selected_experts.data_ptr<int32_t>(),
@@ -673,7 +676,7 @@ torch::Tensor moe_q8_forward_impl(
         );
     }
 
-    T* final_output_ptr = final_output.data_ptr<T>();
+    T* final_output_ptr = x.data_ptr<T>();
     const T* routing_weights_ptr = routing_weights.data_ptr<T>();
     const float* intermediate_act2_ptr = intermediate_act2.data_ptr<float>();
 
@@ -705,7 +708,7 @@ torch::Tensor moe_q8_forward_impl(
         }
     });
     
-    return final_output;
+    return x;
 }
 
 // 调度器函数，Pybind将绑定到此函数

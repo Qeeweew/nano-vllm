@@ -9,9 +9,6 @@ def benchmark(llm: LLM, batch_size: int):
     max_input_len = 1
     max_ouput_len = 256
 
-    # enforce_eager = True to disable cuda graph
-
-
     prompt_token_ids = [[randint(0, 10000) for _ in  range(max_input_len)] for _ in range(num_seqs)]
     sampling_params = [SamplingParams(temperature=0.6, ignore_eos=True, max_tokens=max_ouput_len) for _ in range(num_seqs)]
     # uncomment the following line for vllm
@@ -28,6 +25,7 @@ def benchmark(llm: LLM, batch_size: int):
 def main():
     seed(0)
     path = os.path.expanduser("/root/autodl-tmp/OLMoE-1B-7B-0924/")
+    # enforce_eager = True to disable cuda graph
     llm = LLM(path, enforce_eager=True, max_model_len=4096)
     for batch_size in [1, 2, 4, 8, 16, 32, 64, 128, 256]:
         print(f"Batch size: {batch_size}")

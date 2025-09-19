@@ -10,7 +10,7 @@ from nanovllm.layers.layernorm import RMSNorm
 from nanovllm.layers.linear import QKVParallelLinear, Linear, CPULinear, MergedCPULinear
 from nanovllm.layers.rotary_embedding import get_rope
 from nanovllm.layers.embed_head import VocabParallelEmbedding, ParallelLMHead
-
+from nanovllm.utils.context import get_context
 
 class OlmoeAttention(nn.Module):
     def __init__(
@@ -119,20 +119,29 @@ class OlmoeSparseMoeBlock(nn.Module):
         super().__init__()
         self.num_experts = config.num_experts
         self.top_k = config.num_experts_per_tok
+        self.hidden_size = config.hidden_size
+        self.intermediate_size = config.intermediate_size
 
         self.norm_top_k_prob = getattr(config, "norm_top_k_prob", False)
 
         # Gate runs on GPU to select experts
         self.gate = Linear(config.hidden_size, self.num_experts, bias=False)
-
-        # This list will be populated, used for quantization, and then removed.
-        self.experts = nn.ModuleList([OlmoeMLP(config) for _ in range(self.num_experts)])
-
-        # Buffers for stacked quantized weights. These will be populated by the quantization utility.
-        self.register_buffer("gate_up_qs_stacked", torch.empty(0, dtype=torch.int8))
-        self.register_buffer("gate_up_d_stacked", torch.empty(0, dtype=torch.half))
-        self.register_buffer("down_proj_qs_stacked", torch.empty(0, dtype=torch.int8))
-        self.register_buffer("down_proj_d_stacked", torch.empty(0, dtype=torch.half))
+        
+        # gate_up_proj combines gate_proj and up_proj, so output_dim is intermediate_size * 2
+        self.gate_up_qs_stacked = nn.Parameter(torch.empty(
+            self.num_experts, self.intermediate_size * 2, self.hidden_size, dtype=torch.int8, device="cpu"
+        ), requires_grad=False)
+        self.gate_up_d_stacked = nn.Parameter(torch.empty(
+            self.num_experts, self.intermediate_size * 2, self.hidden_size // 32, dtype=torch.half, device="cpu"
+        ), requires_grad=False)
+        
+        # down_proj
+        self.down_proj_qs_stacked = nn.Parameter(torch.empty(
+            self.num_experts, self.hidden_size, self.intermediate_size, dtype=torch.int8, device="cpu"
+        ), requires_grad=False)
+        self.down_proj_d_stacked = nn.Parameter(torch.empty(
+            self.num_experts, self.hidden_size, self.intermediate_size // 32, dtype=torch.half, device="cpu"
+        ), requires_grad=False)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         # Input hidden_states is expected to be 2D: [num_tokens, hidden_dim]
@@ -140,6 +149,8 @@ class OlmoeSparseMoeBlock(nn.Module):
             raise ValueError(f"OlmoeSparseMoeBlock expects a 2D input, but got shape {hidden_states.shape}")
 
         orig_device = hidden_states.device
+        B, H = hidden_states.shape
+
         
         # === 1. GPU Part: Routing ===
         router_logits = self.gate(hidden_states)
@@ -149,15 +160,23 @@ class OlmoeSparseMoeBlock(nn.Module):
             routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
 
         # === 2. Transfer Data to CPU ===
-        hidden_states_cpu = hidden_states.to(device="cpu")
-        routing_weights_cpu = routing_weights.to(device="cpu")
-        selected_experts_cpu = selected_experts.to(device="cpu")
+        ctx = get_context()
+
+        pinned_hidden = ctx.get_pinned_buffer("moe_hidden", (B, H), hidden_states.dtype)
+        pinned_routing = ctx.get_pinned_buffer("moe_routing", (B, self.top_k), routing_weights.dtype)
+        pinned_experts = ctx.get_pinned_buffer("moe_experts", (B, self.top_k), selected_experts.dtype)
+
+        # 异步拷贝
+        pinned_hidden.copy_(hidden_states, non_blocking=True)
+        pinned_routing.copy_(routing_weights, non_blocking=True)
+        pinned_experts.copy_(selected_experts, non_blocking=True)
 
         # === 3. CPU Part: Expert Computation via C++ Kernel ===
-        final_hidden_states_cpu = nanovllm_ext.moe_q8_forward(
-            hidden_states_cpu,
-            routing_weights_cpu,
-            selected_experts_cpu,
+        # inplace operation to save memory
+        pinned_hidden = nanovllm_ext.moe_q8_forward(
+            pinned_hidden,
+            pinned_routing,
+            pinned_experts,
             self.gate_up_qs_stacked,
             self.gate_up_d_stacked,
             self.down_proj_qs_stacked,
@@ -165,7 +184,34 @@ class OlmoeSparseMoeBlock(nn.Module):
         )
         
         # === 4. Transfer Result back to GPU ===
-        return final_hidden_states_cpu.to(device=orig_device, non_blocking=True)
+        return pinned_hidden.to(device=orig_device, non_blocking=True)
+
+    def expert_weight_loader(self, loaded_weight: torch.Tensor, expert_idx: int, proj_name: str):
+        """
+        Receives a single expert's weight, quantizes it, and places it into the correct
+        slice of the stacked parameter tensors.
+        """
+        # Ensure weight is on CPU and contiguous for the C++ extension
+        loaded_weight = loaded_weight.contiguous().to(device="cpu", dtype=torch.float32)
+
+        # Quantize the weight
+        qs, d = nanovllm_ext.quantize_repack_weight(loaded_weight)
+
+        # Place the quantized tensors into the correct slice of the stacked parameters
+        if proj_name == "gate_proj":
+            # This is the first half of the merged gate_up tensor
+            self.gate_up_qs_stacked.data[expert_idx, :self.intermediate_size, :] = qs
+            self.gate_up_d_stacked.data[expert_idx, :self.intermediate_size, :] = d
+        elif proj_name == "up_proj":
+            # This is the second half of the merged gate_up tensor
+            self.gate_up_qs_stacked.data[expert_idx, self.intermediate_size:, :] = qs
+            self.gate_up_d_stacked.data[expert_idx, self.intermediate_size:, :] = d
+        elif proj_name == "down_proj":
+            self.down_proj_qs_stacked.data[expert_idx] = qs
+            self.down_proj_d_stacked.data[expert_idx] = d
+        else:
+            raise ValueError(f"Unknown expert projection name: {proj_name}")
+
 
 class OlmoeDecoderLayer(nn.Module):
     def __init__(self, config: OlmoeConfig) -> None:
@@ -225,9 +271,6 @@ class OlmoeForCausalLM(nn.Module):
         "q_proj": ("qkv_proj", "q"),
         "k_proj": ("qkv_proj", "k"),
         "v_proj": ("qkv_proj", "v"),
-        # Expert MLPs
-        "gate_proj": ("gate_up_proj", 0),
-        "up_proj": ("gate_up_proj", 1),
     }
 
     def __init__(self, config: OlmoeConfig) -> None:

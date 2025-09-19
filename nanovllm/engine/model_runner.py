@@ -11,7 +11,6 @@ from nanovllm.models.olmoe import OlmoeForCausalLM
 from nanovllm.layers.sampler import Sampler
 from nanovllm.utils.context import set_context, get_context, reset_context
 from nanovllm.utils.loader import load_model
-from nanovllm.utils.quantize import quantize_and_replace_mlp, quantize_and_replace_moe_mlp
 
 class ModelRunner:
 
@@ -39,11 +38,6 @@ class ModelRunner:
             raise ValueError(f"Unsupported model type: {hf_config.model_type}")
 
         load_model(self.model, config.model)
-
-        if hf_config.model_type == "olmoe":
-            quantize_and_replace_moe_mlp(self.model)
-        elif "qwen" in hf_config.model_type:
-            quantize_and_replace_mlp(self.model)
 
         self.sampler = Sampler()
         import time
