@@ -2,13 +2,12 @@
 import torch
 from torch import nn
 import torch.nn.functional as F
-import torch.distributed as dist
 from transformers import OlmoeConfig
 
 from nanovllm.layers.activation import SiluAndMul
 from nanovllm.layers.attention import Attention
 from nanovllm.layers.layernorm import RMSNorm
-from nanovllm.layers.linear import QKVParallelLinear, RowParallelLinear, CPULinear, MergedCPULinear, ReplicatedLinear
+from nanovllm.layers.linear import QKVParallelLinear, Linear, CPULinear, MergedCPULinear
 from nanovllm.layers.rotary_embedding import get_rope
 from nanovllm.layers.embed_head import VocabParallelEmbedding, ParallelLMHead
 
@@ -19,12 +18,11 @@ class OlmoeAttention(nn.Module):
         config: OlmoeConfig,
     ) -> None:
         super().__init__()
-        tp_size = dist.get_world_size()
         self.hidden_size = config.hidden_size
         self.total_num_heads = config.num_attention_heads
         self.total_num_kv_heads = config.num_key_value_heads
-        self.num_heads = self.total_num_heads // tp_size
-        self.num_kv_heads = self.total_num_kv_heads // tp_size
+        self.num_heads = self.total_num_heads
+        self.num_kv_heads = self.total_num_kv_heads
         self.head_dim = self.hidden_size // self.total_num_heads
         self.scaling = self.head_dim ** -0.5
 
@@ -37,7 +35,7 @@ class OlmoeAttention(nn.Module):
             self.total_num_kv_heads,
             bias=config.attention_bias,
         )
-        self.o_proj = RowParallelLinear(
+        self.o_proj = Linear(
             self.total_num_heads * self.head_dim,
             self.hidden_size,
             bias=config.attention_bias,
@@ -125,7 +123,7 @@ class OlmoeSparseMoeBlock(nn.Module):
         self.norm_top_k_prob = getattr(config, "norm_top_k_prob", False)
 
         # Gate runs on GPU to select experts
-        self.gate = ReplicatedLinear(config.hidden_size, self.num_experts, bias=False)
+        self.gate = Linear(config.hidden_size, self.num_experts, bias=False)
 
         # This list will be populated, used for quantization, and then removed.
         self.experts = nn.ModuleList([OlmoeMLP(config) for _ in range(self.num_experts)])
@@ -146,6 +144,9 @@ class OlmoeSparseMoeBlock(nn.Module):
         # === 1. GPU Part: Routing ===
         router_logits = self.gate(hidden_states)
         routing_weights, selected_experts, _ = torch_npu.npu_moe_gating_top_k_softmax(router_logits, None, self.top_k)
+
+        if self.norm_top_k_prob:
+            routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
 
         # === 2. Transfer Data to CPU ===
         hidden_states_cpu = hidden_states.to(device="cpu")

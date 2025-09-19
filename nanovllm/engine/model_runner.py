@@ -1,6 +1,5 @@
 import pickle
 import torch
-import torch.distributed as dist
 import torch_npu
 from multiprocessing.synchronize import Event
 from multiprocessing.shared_memory import SharedMemory
@@ -25,7 +24,6 @@ class ModelRunner:
         self.rank = rank
         self.event = event
 
-        dist.init_process_group("hccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
         torch.npu.set_device(rank)
         default_dtype = torch.get_default_dtype()
         torch.set_default_dtype(hf_config.torch_dtype)
@@ -64,25 +62,8 @@ class ModelRunner:
         # torch.set_default_device("cpu")
         torch.set_default_dtype(default_dtype)
 
-        if self.world_size > 1:
-            if rank == 0:
-                self.shm = SharedMemory(name="nanovllm", create=True, size=2**20)
-                dist.barrier()
-            else:
-                dist.barrier()
-                self.shm = SharedMemory(name="nanovllm")
-                self.loop()
-
     def exit(self):
-        if self.world_size > 1:
-            self.shm.close()
-            dist.barrier()
-            if self.rank == 0:
-                self.shm.unlink()
-        # if not self.enforce_eager:
-        #     del self.graphs, self.graph_pool
         torch.npu.synchronize()
-        dist.destroy_process_group()
 
     def loop(self):
         while True:
