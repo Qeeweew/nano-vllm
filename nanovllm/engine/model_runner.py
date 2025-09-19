@@ -1,13 +1,12 @@
 import pickle
 import torch
-import torch_npu
 from multiprocessing.synchronize import Event
-from multiprocessing.shared_memory import SharedMemory
 
 from nanovllm.config import Config
 from nanovllm.engine.sequence import Sequence
 from nanovllm.models.qwen3 import Qwen3ForCausalLM
 from nanovllm.models.olmoe import OlmoeForCausalLM
+from nanovllm.models.qwen3_moe import Qwen3MoeForCausalLM
 from nanovllm.layers.sampler import Sampler
 from nanovllm.utils.context import set_context, get_context, reset_context
 from nanovllm.utils.loader import load_model
@@ -31,9 +30,14 @@ class ModelRunner:
         if hf_config.model_type == "olmoe":
             self.model = OlmoeForCausalLM(hf_config)
             print("Using OlmoeForCausalLM model.")
+        # Add a specific check for qwen3_moe
+        elif hf_config.model_type == "qwen3_moe":
+            self.model = Qwen3MoeForCausalLM(hf_config)
+            print("Using Qwen3MoeForCausalLM model with CPU offloaded MoE experts.")
+        # The generic 'qwen' check must come AFTER the specific 'qwen3_moe' check
         elif "qwen" in hf_config.model_type:
             self.model = Qwen3ForCausalLM(hf_config)
-            print("Using Qwen3ForCausalLM model.")
+            print("Using Qwen3ForCausalLM (dense) model.")
         else:
             raise ValueError(f"Unsupported model type: {hf_config.model_type}")
 
