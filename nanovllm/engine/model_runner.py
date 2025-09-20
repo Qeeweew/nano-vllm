@@ -1,17 +1,15 @@
 import pickle
 import torch
-import torch.distributed as dist
 from multiprocessing.synchronize import Event
-from multiprocessing.shared_memory import SharedMemory
 
 from nanovllm.config import Config
 from nanovllm.engine.sequence import Sequence
 from nanovllm.models.qwen3 import Qwen3ForCausalLM
 from nanovllm.models.olmoe import OlmoeForCausalLM
+from nanovllm.models.qwen3_moe import Qwen3MoeForCausalLM
 from nanovllm.layers.sampler import Sampler
 from nanovllm.utils.context import set_context, get_context, reset_context
 from nanovllm.utils.loader import load_model
-from nanovllm.utils.quantize import quantize_and_replace_mlp, quantize_and_replace_moe_mlp
 
 class ModelRunner:
 
@@ -24,7 +22,6 @@ class ModelRunner:
         self.rank = rank
         self.event = event
 
-        dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
         torch.cuda.set_device(rank)
         default_dtype = torch.get_default_dtype()
         torch.set_default_dtype(hf_config.torch_dtype)
@@ -33,18 +30,18 @@ class ModelRunner:
         if hf_config.model_type == "olmoe":
             self.model = OlmoeForCausalLM(hf_config)
             print("Using OlmoeForCausalLM model.")
+        # Add a specific check for qwen3_moe
+        elif hf_config.model_type == "qwen3_moe":
+            self.model = Qwen3MoeForCausalLM(hf_config)
+            print("Using Qwen3MoeForCausalLM model with CPU offloaded MoE experts.")
+        # The generic 'qwen' check must come AFTER the specific 'qwen3_moe' check
         elif "qwen" in hf_config.model_type:
             self.model = Qwen3ForCausalLM(hf_config)
-            print("Using Qwen3ForCausalLM model.")
+            print("Using Qwen3ForCausalLM (dense) model.")
         else:
             raise ValueError(f"Unsupported model type: {hf_config.model_type}")
 
         load_model(self.model, config.model)
-
-        if hf_config.model_type == "olmoe":
-            quantize_and_replace_moe_mlp(self.model)
-        elif "qwen" in hf_config.model_type:
-            quantize_and_replace_mlp(self.model)
 
         self.sampler = Sampler()
         import time
@@ -57,31 +54,14 @@ class ModelRunner:
         start_time = time.time()
         
         self.allocate_kv_cache()
-        if not self.enforce_eager:
-            self.capture_cudagraph()
+        # if not self.enforce_eager:
+        #     self.capture_cudagraph()
 
-        torch.set_default_device("cpu")
+        # torch.set_default_device("cpu")
         torch.set_default_dtype(default_dtype)
 
-        if self.world_size > 1:
-            if rank == 0:
-                self.shm = SharedMemory(name="nanovllm", create=True, size=2**20)
-                dist.barrier()
-            else:
-                dist.barrier()
-                self.shm = SharedMemory(name="nanovllm")
-                self.loop()
-
     def exit(self):
-        if self.world_size > 1:
-            self.shm.close()
-            dist.barrier()
-            if self.rank == 0:
-                self.shm.unlink()
-        if not self.enforce_eager:
-            del self.graphs, self.graph_pool
         torch.cuda.synchronize()
-        dist.destroy_process_group()
 
     def loop(self):
         while True:
@@ -246,22 +226,22 @@ class ModelRunner:
 
     @torch.inference_mode()
     def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool):
-        if is_prefill or self.enforce_eager or input_ids.size(0) > 512:
-            return self.model.compute_logits(self.model(input_ids, positions))
-        else:
-            bs = input_ids.size(0)
-            context = get_context()
-            graph = self.graphs[next(x for x in self.graph_bs if x >= bs)]
-            graph_vars = self.graph_vars
-            graph_vars["input_ids"][:bs] = input_ids
-            graph_vars["positions"][:bs] = positions
-            graph_vars["slot_mapping"].fill_(-1)
-            graph_vars["slot_mapping"][:bs] = context.slot_mapping
-            graph_vars["context_lens"].zero_()
-            graph_vars["context_lens"][:bs] = context.context_lens
-            graph_vars["block_tables"][:bs, :context.block_tables.size(1)] = context.block_tables
-            graph.replay()
-            return self.model.compute_logits(graph_vars["outputs"][:bs])
+        # if is_prefill or self.enforce_eager or input_ids.size(0) > 512:
+        return self.model.compute_logits(self.model(input_ids, positions))
+        # else:
+        #     bs = input_ids.size(0)
+        #     context = get_context()
+        #     graph = self.graphs[next(x for x in self.graph_bs if x >= bs)]
+        #     graph_vars = self.graph_vars
+        #     graph_vars["input_ids"][:bs] = input_ids
+        #     graph_vars["positions"][:bs] = positions
+        #     graph_vars["slot_mapping"].fill_(-1)
+        #     graph_vars["slot_mapping"][:bs] = context.slot_mapping
+        #     graph_vars["context_lens"].zero_()
+        #     graph_vars["context_lens"][:bs] = context.context_lens
+        #     graph_vars["block_tables"][:bs, :context.block_tables.size(1)] = context.block_tables
+        #     graph.replay()
+        #     return self.model.compute_logits(graph_vars["outputs"][:bs])
 
     def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
         input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
@@ -271,39 +251,39 @@ class ModelRunner:
         reset_context()
         return token_ids
 
-    @torch.inference_mode()
-    def capture_cudagraph(self):
-        config = self.config
-        hf_config = config.hf_config
-        max_bs = min(self.config.max_num_seqs, 512)
-        max_num_blocks = (config.max_model_len + self.block_size - 1) // self.block_size
-        input_ids = torch.zeros(max_bs, dtype=torch.int64)
-        positions = torch.zeros(max_bs, dtype=torch.int64)
-        slot_mapping = torch.zeros(max_bs, dtype=torch.int32)
-        context_lens = torch.zeros(max_bs, dtype=torch.int32)
-        block_tables = torch.zeros(max_bs, max_num_blocks, dtype=torch.int32)
-        outputs = torch.zeros(max_bs, hf_config.hidden_size)
-        self.graph_bs = [1, 2, 4, 8] + list(range(16, max_bs + 1, 16))
-        self.graphs = {}
-        self.graph_pool = None
+    # @torch.inference_mode()
+    # def capture_cudagraph(self):
+    #     config = self.config
+    #     hf_config = config.hf_config
+    #     max_bs = min(self.config.max_num_seqs, 512)
+    #     max_num_blocks = (config.max_model_len + self.block_size - 1) // self.block_size
+    #     input_ids = torch.zeros(max_bs, dtype=torch.int64)
+    #     positions = torch.zeros(max_bs, dtype=torch.int64)
+    #     slot_mapping = torch.zeros(max_bs, dtype=torch.int32)
+    #     context_lens = torch.zeros(max_bs, dtype=torch.int32)
+    #     block_tables = torch.zeros(max_bs, max_num_blocks, dtype=torch.int32)
+    #     outputs = torch.zeros(max_bs, hf_config.hidden_size)
+    #     self.graph_bs = [1, 2, 4, 8] + list(range(16, max_bs + 1, 16))
+    #     self.graphs = {}
+    #     self.graph_pool = None
 
-        for bs in reversed(self.graph_bs):
-            graph = torch.cuda.CUDAGraph()
-            set_context(False, slot_mapping=slot_mapping[:bs], context_lens=context_lens[:bs], block_tables=block_tables[:bs])
-            outputs[:bs] = self.model(input_ids[:bs], positions[:bs])    # warmup
-            with torch.cuda.graph(graph, self.graph_pool):
-                outputs[:bs] = self.model(input_ids[:bs], positions[:bs])    # capture
-            if self.graph_pool is None:
-                self.graph_pool = graph.pool()
-            self.graphs[bs] = graph
-            torch.cuda.synchronize()
-            reset_context()
+    #     for bs in reversed(self.graph_bs):
+    #         graph = torch.cuda.CUDAGraph()
+    #         set_context(False, slot_mapping=slot_mapping[:bs], context_lens=context_lens[:bs], block_tables=block_tables[:bs])
+    #         outputs[:bs] = self.model(input_ids[:bs], positions[:bs])    # warmup
+    #         with torch.cuda.graph(graph, self.graph_pool):
+    #             outputs[:bs] = self.model(input_ids[:bs], positions[:bs])    # capture
+    #         if self.graph_pool is None:
+    #             self.graph_pool = graph.pool()
+    #         self.graphs[bs] = graph
+    #         torch.cuda.synchronize()
+    #         reset_context()
 
-        self.graph_vars = dict(
-            input_ids=input_ids,
-            positions=positions,
-            slot_mapping=slot_mapping,
-            context_lens=context_lens,
-            block_tables=block_tables,
-            outputs=outputs,
-        )
+    #     self.graph_vars = dict(
+    #         input_ids=input_ids,
+    #         positions=positions,
+    #         slot_mapping=slot_mapping,
+    #         context_lens=context_lens,
+    #         block_tables=block_tables,
+    #         outputs=outputs,
+    #     )

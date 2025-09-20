@@ -1,12 +1,11 @@
 import torch
 from torch import nn
-import torch.distributed as dist
 from transformers import Qwen3Config
 
 from nanovllm.layers.activation import SiluAndMul
 from nanovllm.layers.attention import Attention
 from nanovllm.layers.layernorm import RMSNorm
-from nanovllm.layers.linear import QKVParallelLinear, RowParallelLinear, CPULinear, MergedCPULinear
+from nanovllm.layers.linear import QKVParallelLinear, MergedLinear, Linear
 from nanovllm.layers.rotary_embedding import get_rope
 from nanovllm.layers.embed_head import VocabParallelEmbedding, ParallelLMHead
 
@@ -26,13 +25,10 @@ class Qwen3Attention(nn.Module):
         rope_scaling: tuple | None = None,
     ) -> None:
         super().__init__()
-        tp_size = dist.get_world_size()
         self.total_num_heads = num_heads
-        assert self.total_num_heads % tp_size == 0
-        self.num_heads = self.total_num_heads // tp_size
+        self.num_heads = self.total_num_heads
         self.total_num_kv_heads = num_kv_heads
-        assert self.total_num_kv_heads % tp_size == 0
-        self.num_kv_heads = self.total_num_kv_heads // tp_size
+        self.num_kv_heads = self.total_num_kv_heads
         self.head_dim = head_dim or hidden_size // self.total_num_heads
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
@@ -45,7 +41,7 @@ class Qwen3Attention(nn.Module):
             self.total_num_kv_heads,
             bias=qkv_bias,
         )
-        self.o_proj = RowParallelLinear(
+        self.o_proj = Linear(
             self.total_num_heads * self.head_dim,
             hidden_size,
             bias=False,
@@ -91,12 +87,12 @@ class Qwen3MLP(nn.Module):
         hidden_act: str,
     ) -> None:
         super().__init__()
-        self.gate_up_proj = MergedCPULinear(
+        self.gate_up_proj = MergedLinear(
             hidden_size,
             [intermediate_size] * 2,
             bias=False,
         )
-        self.down_proj = CPULinear(
+        self.down_proj = Linear(
             intermediate_size,
             hidden_size,
             bias=False,
@@ -105,23 +101,12 @@ class Qwen3MLP(nn.Module):
         self.act_fn = SiluAndMul()
 
     def forward(self, x: torch.Tensor):
-        orig_device = x.device
-        # 将输入张量从GPU移动到CPU
-        x_cpu = x.to("cpu")
-        origin_type = x_cpu.dtype
-        if origin_type != torch.float32:
-            x_cpu = x_cpu.to(torch.float32)
 
-        # 在CPU上执行MLP计算
         gate_up = self.gate_up_proj(x_cpu)
         x_cpu = self.act_fn(gate_up)
         x_cpu = self.down_proj(x_cpu)
 
-        # 将结果张量移回原始GPU设备
-        if origin_type != torch.float32:
-            x_cpu = x_cpu.to(origin_type)
-
-        return x_cpu.to(orig_device)
+        return x
 
 
 class Qwen3DecoderLayer(nn.Module):
