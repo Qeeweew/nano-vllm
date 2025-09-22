@@ -1,5 +1,6 @@
 import pickle
 import torch
+import torch_npu
 from multiprocessing.synchronize import Event
 
 from nanovllm.config import Config
@@ -55,7 +56,7 @@ class ModelRunner:
         
         self.allocate_kv_cache()
         # if not self.enforce_eager:
-        #     self.capture_cudagraph()
+        # self.capture_cudagraph()
 
         # torch.set_default_device("cpu")
         torch.set_default_dtype(default_dtype)
@@ -116,7 +117,7 @@ class ModelRunner:
         # Heuristic approach: Reserve a fixed buffer for activations and temporary tensors.
         # This value may need tuning depending on the model and max batch size.
         # 2 GB is a reasonable starting point for models around 7B.
-        activation_memory_buffer_gb = 20.0
+        activation_memory_buffer_gb = 4.0
         activation_memory_buffer_bytes = int(activation_memory_buffer_gb * (1024**3))
         
         print(f"[KV Cache] Total GPU memory: {total/1e9:.2f} GB")
@@ -251,39 +252,39 @@ class ModelRunner:
         reset_context()
         return token_ids
 
-    # @torch.inference_mode()
-    # def capture_cudagraph(self):
-    #     config = self.config
-    #     hf_config = config.hf_config
-    #     max_bs = min(self.config.max_num_seqs, 512)
-    #     max_num_blocks = (config.max_model_len + self.block_size - 1) // self.block_size
-    #     input_ids = torch.zeros(max_bs, dtype=torch.int64)
-    #     positions = torch.zeros(max_bs, dtype=torch.int64)
-    #     slot_mapping = torch.zeros(max_bs, dtype=torch.int32)
-    #     context_lens = torch.zeros(max_bs, dtype=torch.int32)
-    #     block_tables = torch.zeros(max_bs, max_num_blocks, dtype=torch.int32)
-    #     outputs = torch.zeros(max_bs, hf_config.hidden_size)
-    #     self.graph_bs = [1, 2, 4, 8] + list(range(16, max_bs + 1, 16))
-    #     self.graphs = {}
-    #     self.graph_pool = None
+    @torch.inference_mode()
+    def capture_cudagraph(self):
+        config = self.config
+        hf_config = config.hf_config
+        max_bs = min(self.config.max_num_seqs, 512)
+        max_num_blocks = (config.max_model_len + self.block_size - 1) // self.block_size
+        input_ids = torch.zeros(max_bs, dtype=torch.int64)
+        positions = torch.zeros(max_bs, dtype=torch.int64)
+        slot_mapping = torch.zeros(max_bs, dtype=torch.int32)
+        context_lens = torch.zeros(max_bs, dtype=torch.int32, device="cpu")
+        block_tables = torch.zeros(max_bs, max_num_blocks, dtype=torch.int32)
+        outputs = torch.zeros(max_bs, hf_config.hidden_size)
+        self.graph_bs = [1, 2, 4, 8] + list(range(16, max_bs + 1, 16))
+        self.graphs = {}
+        self.graph_pool = None
 
-    #     for bs in reversed(self.graph_bs):
-    #         graph = torch.cuda.CUDAGraph()
-    #         set_context(False, slot_mapping=slot_mapping[:bs], context_lens=context_lens[:bs], block_tables=block_tables[:bs])
-    #         outputs[:bs] = self.model(input_ids[:bs], positions[:bs])    # warmup
-    #         with torch.cuda.graph(graph, self.graph_pool):
-    #             outputs[:bs] = self.model(input_ids[:bs], positions[:bs])    # capture
-    #         if self.graph_pool is None:
-    #             self.graph_pool = graph.pool()
-    #         self.graphs[bs] = graph
-    #         torch.cuda.synchronize()
-    #         reset_context()
+        for bs in reversed(self.graph_bs):
+            graph = torch_npu.npu.NPUGraph()
+            set_context(False, slot_mapping=slot_mapping[:bs], context_lens=context_lens[:bs], block_tables=block_tables[:bs])
+            outputs[:bs] = self.model(input_ids[:bs], positions[:bs])    # warmup
+            with torch.npu.graph(graph, self.graph_pool):
+                outputs[:bs] = self.model(input_ids[:bs], positions[:bs])    # capture
+            if self.graph_pool is None:
+                self.graph_pool = graph.pool()
+            self.graphs[bs] = graph
+            torch.npu.synchronize()
+            reset_context()
 
-    #     self.graph_vars = dict(
-    #         input_ids=input_ids,
-    #         positions=positions,
-    #         slot_mapping=slot_mapping,
-    #         context_lens=context_lens,
-    #         block_tables=block_tables,
-    #         outputs=outputs,
-    #     )
+        self.graph_vars = dict(
+            input_ids=input_ids,
+            positions=positions,
+            slot_mapping=slot_mapping,
+            context_lens=context_lens,
+            block_tables=block_tables,
+            outputs=outputs,
+        )

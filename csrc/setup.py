@@ -16,8 +16,8 @@ setup(
             ['q8_gemm.cpp'],
             # Use -O3 for optimization, -march=native to enable all available CPU instructions (like AVX2),
             # and -fopenmp for OpenMP, which is used by ATen's parallelism backend on CPU.
-            extra_compile_args=['-O3', '-Wall', '-march=armv8.2-a+dotprod+fp16', '-fopenmp', "-I/root/miniconda3/envs/nano-vllm/lib/python3.11/site-packages/torch_npu/include"],
-            extra_link_args=['-fopenmp', "-L/root/miniconda3/envs/nano-vllm/lib/python3.11/site-packages/torch_npu/lib", "-ltorch_npu"],
+            extra_compile_args=['-O3', '-ffast-math', '-Wall', '-march=armv8.2-a+dotprod+fp16', '-fopenmp'],
+            extra_link_args=['-fopenmp'],
         ),
     ],
     cmdclass={

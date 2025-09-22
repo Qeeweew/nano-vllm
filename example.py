@@ -1,7 +1,8 @@
 import os
 import torch
+from torch.profiler import profile, record_function, ProfilerActivity
 import torch_npu
-from torch_npu.profiler import profile, ProfilerActivity
+# from torch_npu.profiler import profile, ProfilerActivity
 from nanovllm import LLM, SamplingParams
 from transformers import AutoTokenizer
 
@@ -24,11 +25,11 @@ def main():
     #     for prompt in prompts
     # ]
     print("Warm-up run...")
-    _ = llm.generate(prompts, sampling_params)
+    _ = llm.generate(prompts, SamplingParams(temperature=0, max_tokens=4))
 
-    print("Warm-up finished. Starting profiling...")
+    # print("Warm-up finished. Starting profiling...")
     
-    # 创建 profiler 上下文
+    # # 创建 profiler 上下文
     # experimental_config = torch_npu.profiler._ExperimentalConfig(
 	#     export_type=torch_npu.profiler.ExportType.Text,
 	#     profiler_level=torch_npu.profiler.ProfilerLevel.Level0,
@@ -47,21 +48,19 @@ def main():
     #                 ],
     #         schedule=torch_npu.profiler.schedule(wait=0, warmup=0, active=1, repeat=1, skip_first=0),
     #         on_trace_ready=torch_npu.profiler.tensorboard_trace_handler("./prof_log"),
-    #         record_shapes=True,
+    #         record_shapes=False,
     #         profile_memory=False,
-    #         with_stack=True,
-    #         with_modules=True,
+    #         with_stack=False,
+    #         with_modules=False,
     #         with_flops=False,
     #         experimental_config=experimental_config) as prof:
-    #         outputs = llm.generate(prompts, sampling_params)
+    #         outputs = llm.generate(prompts, sampling_params, use_tqdm=False)
     #         prof.step()
-
-
     # --- Profiling部分结束 ---
 
     # 打印 profiler 总结信息到控制台
 
-    outputs = llm.generate(prompts, sampling_params)
+    outputs = llm.generate(prompts, sampling_params, use_tqdm=True)
 
     # 打印正常输出
     for prompt, output in zip(prompts, outputs):

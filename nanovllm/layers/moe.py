@@ -51,37 +51,39 @@ class SparseMoeBlock(nn.Module):
             self.num_experts, self.hidden_size, self.intermediate_size // 32, dtype=torch.half, device="cpu"
         ), requires_grad=False)
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        # Input hidden_states is expected to be 2D: [num_tokens, hidden_dim]
-        if hidden_states.dim() != 2:
-            raise ValueError(f"OlmoeSparseMoeBlock expects a 2D input, but got shape {hidden_states.shape}")
-
-        orig_device = hidden_states.device
-        B, H = hidden_states.shape
-
-        
-        # === 1. GPU Part: Routing ===
+    def forward_pre_expert(
+        self,
+        hidden_states: torch.Tensor,
+        pinned_hidden: torch.Tensor,
+        pinned_routing: torch.Tensor,
+        pinned_experts: torch.Tensor,
+    ):
+        """
+        Phase 1 (NPU, Graphable): Routing and dispatching data to CPU pinned memory.
+        """
+        # === 1. NPU Part: Routing ===
+        pinned_hidden.copy_(hidden_states, non_blocking=True)
         router_logits = self.gate(hidden_states)
         routing_weights, selected_experts, _ = torch_npu.npu_moe_gating_top_k_softmax(router_logits, None, self.top_k)
 
         if self.norm_top_k_prob:
             routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
-
-        # === 2. Transfer Data to CPU ===
-        ctx = get_context()
-
-        pinned_hidden = ctx.get_pinned_buffer("moe_hidden", (B, H), hidden_states.dtype)
-        pinned_routing = ctx.get_pinned_buffer("moe_routing", (B, self.top_k), routing_weights.dtype)
-        pinned_experts = ctx.get_pinned_buffer("moe_experts", (B, self.top_k), selected_experts.dtype)
-
-        # 异步拷贝
-        pinned_hidden.copy_(hidden_states, non_blocking=True)
+        
+        # === 2. Transfer Data to CPU (Graphable Operation) ===
         pinned_routing.copy_(routing_weights, non_blocking=True)
         pinned_experts.copy_(selected_experts, non_blocking=True)
 
-        # === 3. CPU Part: Expert Computation via C++ Kernel ===
-        # inplace operation to save memory
-        pinned_hidden = nanovllm_ext.moe_q8_forward(
+    def forward_cpu_expert(
+        self,
+        pinned_hidden: torch.Tensor,
+        pinned_routing: torch.Tensor,
+        pinned_experts: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Phase 2 (CPU, Eager): Run the expert computation on CPU.
+        Returns the result in the same pinned buffer (inplace).
+        """
+        return nanovllm_ext.moe_q8_forward(
             pinned_hidden,
             pinned_routing,
             pinned_experts,
@@ -90,9 +92,30 @@ class SparseMoeBlock(nn.Module):
             self.down_proj_qs_stacked,
             self.down_proj_d_stacked
         )
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """
+        Original forward method for eager execution.
+        """
+        orig_device = hidden_states.device
+        B, H = hidden_states.shape
+
+        # Get buffers for this specific call
+        ctx = get_context()
+        pinned_hidden = ctx.get_pinned_buffer("moe_hidden", (B, H), hidden_states.dtype)
+        pinned_routing = ctx.get_pinned_buffer("moe_routing", (B, self.top_k), hidden_states.dtype)
+        pinned_experts = ctx.get_pinned_buffer("moe_experts", (B, self.top_k), torch.int32)
         
-        # === 4. Transfer Result back to GPU ===
-        return pinned_hidden.to(device=orig_device, non_blocking=True)
+        # Phase 1
+        self.forward_pre_expert(hidden_states, pinned_hidden, pinned_routing, pinned_experts)
+        
+        # Must synchronize here in eager mode to ensure data is on CPU
+        torch.npu.synchronize()
+
+        # Phase 2
+        pinned_hidden_result = self.forward_cpu_expert(pinned_hidden, pinned_routing, pinned_experts)
+        
+        return pinned_hidden_result.to(orig_device, non_blocking=True)
 
     def expert_weight_loader(self, loaded_weight: torch.Tensor, expert_idx: int, proj_name: str):
         """

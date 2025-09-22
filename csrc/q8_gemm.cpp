@@ -1,8 +1,6 @@
 #include <torch/extension.h>
-#include <torch_npu/csrc/core/npu/NPUStream.h>
 #include <type_traits>
 #include <vector>
-#include <functional>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -10,7 +8,7 @@
 #include <cassert>
 #include <algorithm>
 #include <ATen/Parallel.h>
-#include <ATen/cpu/vec/vec.h>
+#include "vec_simd.hpp"
 
 #if defined(__ARM_NEON)
 #include <arm_neon.h>
@@ -365,16 +363,14 @@ void gemm_q8_0_microkernel(int kc_size, int mr, const int8_t* A_qs_packed, const
     }
 }
 
-void gemm_q8_0_aten_parallel_packed(int M, int N, int K, const float* A, int lda, const int8_t* B_qs_packed, const ggml_half* B_d_packed_f16, float* C) {
-    assert(K % QK8_0 == 0);
+template <typename T>
+static void quantize_pack_A_parallel_q8_0(
+    int M, int K, const T* A, int lda,
+    int8_t* A_qs_packed, float* A_d_packed)
+{
     const int K_BLOCKS = K / QK8_0;
-    const int M_CEIL = (M + MR - 1) / MR * MR;
-    
-    int8_t* A_qs_packed = static_cast<int8_t*>(std::aligned_alloc(64, M_CEIL * K * sizeof(int8_t)));
-    float* A_d_packed = static_cast<float*>(std::aligned_alloc(64, M_CEIL * K_BLOCKS * sizeof(float)));
-
-    // Phase 1: Pack A in parallel using ATen
     const int num_a_packs = (M + MR - 1) / MR;
+    
     at::parallel_for(0, num_a_packs, 0, [&](int64_t start, int64_t end) {
         int8_t a_qs_buf[MR * QK8_0];
         for (int64_t i_pack = start; i_pack < end; ++i_pack) {
@@ -383,7 +379,15 @@ void gemm_q8_0_aten_parallel_packed(int M, int N, int K, const float* A, int lda
                 int M_rem = std::min(MR, M - i);
                 float* current_A_d_ptr = A_d_packed + i * K_BLOCKS + j * MR;
                 for (int row = 0; row < M_rem; ++row) {
-                    quantize_block_q8_0(A + (i + row) * lda + j * QK8_0, &current_A_d_ptr[row], &a_qs_buf[row * QK8_0]);
+                    if constexpr(std::is_same_v<T, float>) {
+                        quantize_block_q8_0(A + (i + row) * lda + j * QK8_0, &current_A_d_ptr[row], &a_qs_buf[row * QK8_0]);
+                    } else {
+                        float a_float_buf[QK8_0];
+                        for (int k = 0; k < QK8_0; ++k) {
+                            a_float_buf[k] = static_cast<float>(A[(i + row) * lda + j * QK8_0 + k]);
+                        }
+                        quantize_block_q8_0(a_float_buf + row * QK8_0, &current_A_d_ptr[row], &a_qs_buf[row * QK8_0]);
+                    }
                 }
                 int8_t* current_qs_ptr = A_qs_packed + i * K + j * QK8_0 * MR;
                 for (int k = 0; k < QK8_0; k += 4) {
@@ -395,38 +399,109 @@ void gemm_q8_0_aten_parallel_packed(int M, int N, int K, const float* A, int lda
             }
         }
     });
+}
 
-    // Phase 2: GEMM computation in parallel using ATen
+// ==========================================================================================
+// NEW: Function to perform GEMM computation with pre-packed matrices
+// ==========================================================================================
+static void gemm_q8_0_compute_packed(
+    int M, int N, int K,
+    const int8_t* A_qs_packed, const float* A_d_packed,
+    const int8_t* B_qs_packed, const ggml_half* B_d_packed_f16,
+    float* C, int ldc)
+{
+    const int K_BLOCKS = K / QK8_0;
     constexpr int MC = 32; constexpr int KC = 1024; constexpr int NC = 32;
     const int num_nc_blocks = (N + NC - 1) / NC;
-    at::parallel_for(0, num_nc_blocks, 0, [&](int64_t start, int64_t end) {
-        for (int64_t jc_idx = start; jc_idx < end; ++jc_idx) {
-            int jc = jc_idx * NC;
-            const int nc = std::min(NC, N - jc);
-            for (int kc = 0; kc < K; kc += KC) {
-                const int kc_size = std::min(KC, K - kc);
-                // const int kc_blocks = kc_size / QK8_0;
-                const int k_block_offset = kc / QK8_0;
-                for (int ic = 0; ic < M; ic += MC) {
-                    const int mc = std::min(MC, M - ic);
-                    for (int jr = 0; jr < nc; jr += NR) {
-                        for (int ir = 0; ir < mc; ir += MR) {
-                            gemm_q8_0_microkernel(
-                                kc_size, std::min(MR, mc - ir),
-                                A_qs_packed + (ic + ir) * K + kc * MR,
-                                A_d_packed + (ic + ir) * K_BLOCKS + k_block_offset * MR,
-                                B_qs_packed + (jc + jr) * K + kc * NR,
-                                B_d_packed_f16 + (jc + jr) * K_BLOCKS + k_block_offset * NR,
-                                C + (ic + ir) * N + (jc + jr), N, kc != 0);
+
+    if (M <= MR) {
+        at::parallel_for(0, num_nc_blocks, 0, [&](int64_t start, int64_t end) {
+            for (int64_t jc_idx = start; jc_idx < end; ++jc_idx) {
+                int jc = jc_idx * NC;
+                const int nc = std::min(NC, N - jc);
+                for (int jr = 0; jr < nc; jr += NR) {
+                    gemm_q8_0_microkernel(
+                        K, M,
+                        A_qs_packed,
+                        A_d_packed,
+                        B_qs_packed + (jc + jr) * K,
+                        B_d_packed_f16 + (jc + jr) * (K / QK8_0),
+                        C + (jc + jr),
+                        ldc,
+                        false);
+                }
+            }
+        });
+    } else {
+        at::parallel_for(0, num_nc_blocks, 0, [&](int64_t start, int64_t end) {
+            for (int64_t jc_idx = start; jc_idx < end; ++jc_idx) {
+                int jc = jc_idx * NC;
+                const int nc = std::min(NC, N - jc);
+                for (int kc = 0; kc < K; kc += KC) {
+                    const int kc_size = std::min(KC, K - kc);
+                    const int k_block_offset = kc / QK8_0;
+                    for (int ic = 0; ic < M; ic += MC) {
+                        const int mc = std::min(MC, M - ic);
+                        for (int jr = 0; jr < nc; jr += NR) {
+                            for (int ir = 0; ir < mc; ir += MR) {
+                                gemm_q8_0_microkernel(
+                                    kc_size, std::min(MR, mc - ir),
+                                    A_qs_packed + (ic + ir) * K + kc * MR,
+                                    A_d_packed + (ic + ir) * K_BLOCKS + k_block_offset * MR,
+                                    B_qs_packed + (jc + jr) * K + kc * NR,
+                                    B_d_packed_f16 + (jc + jr) * K_BLOCKS + k_block_offset * NR,
+                                    C + (ic + ir) * ldc + (jc + jr), ldc, kc != 0);
+                            }
                         }
                     }
                 }
             }
-        }
-    });
+        });
+    }
+}
+
+void gemm_q8_0_aten_parallel_packed(int M, int N, int K, const float* A, int lda, const int8_t* B_qs_packed, const ggml_half* B_d_packed_f16, float* C) {
+    assert(K % QK8_0 == 0);
+    const int K_BLOCKS = K / QK8_0;
+    const int M_CEIL = (M + MR - 1) / MR * MR;
+    
+    int8_t* A_qs_packed = static_cast<int8_t*>(std::aligned_alloc(64, M_CEIL * K * sizeof(int8_t)));
+    float* A_d_packed = static_cast<float*>(std::aligned_alloc(64, M_CEIL * K_BLOCKS * sizeof(float)));
+
+    // Phase 1: Quantize and Pack A
+    quantize_pack_A_parallel_q8_0<float>(M, K, A, lda, A_qs_packed, A_d_packed);
+
+    // Phase 2: GEMM Computation
+    gemm_q8_0_compute_packed(M, N, K, A_qs_packed, A_d_packed, B_qs_packed, B_d_packed_f16, C, N);
 
     std::free(A_qs_packed);
     std::free(A_d_packed);
+}
+
+template <typename T>
+static void quantize_rows_parallel_q8_0(
+    int M, int K, const T* A, int lda,
+    int8_t* A_qs, float* A_d)
+{
+    const int K_BLOCKS = K / QK8_0;
+    at::parallel_for(0, M, 0, [&](int64_t start, int64_t end) {
+        std::vector<float> temp_row(K);
+        for(int64_t i = start; i < end; ++i) {
+            const T* src_row = A + i * lda;
+            // Convert input row to float for quantization
+            for(int j = 0; j < K; ++j) {
+                temp_row[j] = static_cast<float>(src_row[j]);
+            }
+            // Quantize each block in the row
+            for (int k_block = 0; k_block < K_BLOCKS; ++k_block) {
+                quantize_block_q8_0(
+                    temp_row.data() + k_block * QK8_0,
+                    A_d + i * K_BLOCKS + k_block,
+                    A_qs + i * K + k_block * QK8_0
+                );
+            }
+        }
+    });
 }
 
 // ==========================================================================================
@@ -552,42 +627,44 @@ static void preprocess_moe_routing(
     }
 }
 
+static void pack_A_q8_0_from_quantized_indirect(
+    int M, int K,
+    const int8_t* x_qs_base,           // 原始量化数据（未 gather）
+    const float* x_d_base,             // 原始 scale 数据
+    const MoETokenInfo* token_map,     // 间接索引映射表
+    int token_offset,                  // 当前专家的起始 token 在 token_map 中的偏移
+    int8_t* A_qs_packed,
+    float* A_d_packed
+) {
+    const int K_BLOCKS = K / QK8_0;
+    const int num_a_packs = (M + MR - 1) / MR;
 
-// A specialized SiLU activation function for MoE.
-// x = gate_proj(x), y = up_proj(x)
-// return silu(x) * y
-using Vec = at::vec::Vectorized<float>;
+    at::parallel_for(0, num_a_packs, 0, [&](int64_t start, int64_t end) {
+        for (int64_t i_pack = start; i_pack < end; ++i_pack) {
+            int row_in_expert = i_pack * MR;  // 当前 pack 在专家局部行号
+            for (int j = 0; j < K_BLOCKS; ++j) {
+                int M_rem = std::min(MR, M - row_in_expert);
+                float* current_A_d_ptr = A_d_packed + row_in_expert * K_BLOCKS + j * MR;
 
-static void silu_and_mul(float* C, int num_tokens, int intermediate_size) {
-    const int size_div_2 = intermediate_size / 2;
-    at::parallel_for(0, num_tokens, 0, [&](int64_t start, int64_t end) {
-        for (int64_t i = start; i < end; ++i) {
-            float* row = C + i * intermediate_size;
-            float* gate_part = row;
-            float* up_part = row + size_div_2;
-            
-            int j = 0;
-            // 1. Vectorized 主循环
-            // 每次处理 Vec::size() 个 float 元素
-            for (; j + Vec::size() <= size_div_2; j += Vec::size()) {
-                // 从内存加载数据到向量寄存器
-                Vec gate_vec = Vec::loadu(gate_part + j);
-                Vec up_vec = Vec::loadu(up_part + j);
+                // 逐行复制 d 值：从原始 x_d_base + token_map[token_offset + row].token_id
+                for (int local_row = 0; local_row < M_rem; ++local_row) {
+                    int global_token_id = token_map[token_offset + row_in_expert + local_row].token_id;
+                    current_A_d_ptr[local_row] = x_d_base[global_token_id * K_BLOCKS + j];
+                }
 
-                const Vec one_vec(1.0f);
-                Vec activation_vec = gate_vec / (one_vec + gate_vec.neg().exp());
-                Vec result_vec = up_vec * activation_vec;
-
-                result_vec.store(row + j);
-            }
-
-            // 2. Scalar 收尾循环
-            // 处理剩余不足一个向量长度的元素
-            for (; j < size_div_2; ++j) {
-                float gate_val = gate_part[j];
-                // SiLU (Swish) 激活函数: x * sigmoid(x)
-                float activation = gate_val / (1.0f + expf(-gate_val));
-                row[j] = up_part[j] * activation;
+                // Pack qs 值
+                int8_t* current_qs_ptr = A_qs_packed + row_in_expert * K + j * QK8_0 * MR;
+                for (int k = 0; k < QK8_0; k += 4) {
+                    for (int local_row = 0; local_row < MR; ++local_row) {
+                        if (local_row < M_rem) {
+                            int global_token_id = token_map[token_offset + row_in_expert + local_row].token_id;
+                            memcpy(current_qs_ptr,
+                                   x_qs_base + global_token_id * K + j * QK8_0 + k,
+                                   4);
+                        }
+                        current_qs_ptr += 4;
+                    }
+                }
             }
         }
     });
@@ -609,17 +686,14 @@ torch::Tensor moe_q8_forward_impl(
     const auto intermediate_size_x2 = gate_up_qs_stacked.size(1);
     const auto intermediate_size = down_proj_qs_stacked.size(2);
     const auto top_k = selected_experts.size(1);
+    const auto hidden_dim_k_blocks = hidden_dim / QK8_0;
+    const auto intermediate_dim_k_blocks = intermediate_size / QK8_0;
 
-    // final_output 将具有与输入x相同的dtype
-    c10_npu::NPUStream stream = c10_npu::getCurrentNPUStream();
-    
     std::vector<int> expert_counts(num_experts, 0);
     std::vector<int> expert_starts(num_experts + 1, 0);
     std::vector<MoETokenInfo> token_map;
     std::vector<int32_t> scatter_map;
    
-    stream.synchronize();
-
     preprocess_moe_routing(
         num_experts, top_k, num_tokens, selected_experts.data_ptr<int32_t>(),
         expert_counts, expert_starts, token_map, scatter_map
@@ -627,60 +701,78 @@ torch::Tensor moe_q8_forward_impl(
 
     const int total_expert_tokens = expert_starts[num_experts];
     
-    // 中间计算统一使用 float32 以保证精度
-    auto gathered_x = torch::empty({total_expert_tokens, hidden_dim}, torch::kFloat);
-    auto expert_intermediate1 = torch::empty({num_tokens, intermediate_size_x2}, torch::kFloat); // 优化内存
-    auto intermediate_act2 = torch::empty({total_expert_tokens, hidden_dim}, torch::kFloat);
+    std::vector<int8_t> x_qs(num_tokens * hidden_dim);
+    std::vector<float> x_d(num_tokens * hidden_dim_k_blocks);
+    quantize_rows_parallel_q8_0<T>(
+        num_tokens, hidden_dim, x.data_ptr<T>(), hidden_dim,
+        x_qs.data(), x_d.data()
+    );
 
-    float* gathered_x_ptr = gathered_x.data_ptr<float>();
-    const T* x_ptr = x.data_ptr<T>();
+    const int max_expert_tokens = total_expert_tokens > 0 ? *std::max_element(expert_counts.begin(), expert_counts.end()) : 0;
+    const int M_CEIL_GEMM = (max_expert_tokens + MR - 1) / MR * MR;
 
-    // Parallel Gather: 从 T 转换为 float
-    at::parallel_for(0, total_expert_tokens, 0, [&](int64_t start, int64_t end) {
-        for (int64_t i = start; i < end; ++i) {
-            const T* src_ptr = x_ptr + token_map[i].token_id * hidden_dim;
-            float* dst_ptr = gathered_x_ptr + i * hidden_dim;
-            for (int j = 0; j < hidden_dim; ++j) {
-                dst_ptr[j] = static_cast<float>(src_ptr[j]);
-            }
-        }
-    });
+    int8_t* A_qs_packed1 = static_cast<int8_t*>(std::aligned_alloc(64, M_CEIL_GEMM * hidden_dim * sizeof(int8_t)));
+    float* A_d_packed1 = static_cast<float*>(std::aligned_alloc(64, M_CEIL_GEMM * hidden_dim_k_blocks * sizeof(float)));
+    int8_t* A_qs_packed2 = static_cast<int8_t*>(std::aligned_alloc(64, M_CEIL_GEMM * intermediate_size * sizeof(int8_t)));
+    float* A_d_packed2 = static_cast<float*>(std::aligned_alloc(64, M_CEIL_GEMM * intermediate_dim_k_blocks * sizeof(float)));
+
+    float* expert_intermediate1 = static_cast<float*>(std::aligned_alloc(64, max_expert_tokens * intermediate_size_x2 * sizeof(float)));
+    float* expert_intermediate2 = static_cast<float*>(std::aligned_alloc(64, total_expert_tokens * hidden_dim * sizeof(float)));
+
+    int8_t* gate_up_qs_stacked_ptr = gate_up_qs_stacked.data_ptr<int8_t>();
+    int8_t* down_proj_qs_statcked_ptr = down_proj_qs_stacked.data_ptr<int8_t>();
+    at::Half* gate_up_d_stacked_ptr = gate_up_d_stacked.data_ptr<at::Half>();
+    at::Half* down_proj_d_stacked_ptr = down_proj_d_stacked.data_ptr<at::Half>();
 
     for (int64_t exp_id = 0; exp_id < num_experts; ++exp_id) {
         int count = expert_counts[exp_id];
         if (count == 0) continue;
         int start_pos = expert_starts[exp_id];
 
-        auto expert_gathered_x = gathered_x.slice(0, start_pos, start_pos + count);
-        auto expert_intermediate2 = intermediate_act2.slice(0, start_pos, start_pos + count);
-            
-        // GEMM 1: gate_up_proj
-        gemm_q8_0_aten_parallel_packed(
+        int8_t* gate_up_qs_ptr = gate_up_qs_stacked_ptr + exp_id * intermediate_size_x2 * hidden_dim;
+        at::Half* gate_up_d_ptr = gate_up_d_stacked_ptr + exp_id * intermediate_size_x2 * hidden_dim_k_blocks;
+        int8_t* down_proj_qs_ptr = down_proj_qs_statcked_ptr + exp_id * hidden_dim * intermediate_size;
+        at::Half* down_proj_d_ptr = down_proj_d_stacked_ptr + exp_id * hidden_dim * intermediate_dim_k_blocks;
+
+        pack_A_q8_0_from_quantized_indirect(
+            count, hidden_dim,
+            x_qs.data(), x_d.data(), token_map.data(), start_pos,
+            A_qs_packed1, A_d_packed1
+        );
+
+        // GEMM 1
+        gemm_q8_0_compute_packed(
             count, intermediate_size_x2, hidden_dim,
-            expert_gathered_x.data_ptr<float>(), hidden_dim,
-            gate_up_qs_stacked[exp_id].data_ptr<int8_t>(),
-            reinterpret_cast<const ggml_half*>(gate_up_d_stacked[exp_id].data_ptr<at::Half>()),
-            expert_intermediate1.data_ptr<float>()
+            A_qs_packed1, A_d_packed1,
+            gate_up_qs_ptr,
+            reinterpret_cast<const ggml_half*>(gate_up_d_ptr),
+            expert_intermediate1,
+            intermediate_size_x2
         );
 
         // Activation
-        silu_and_mul(expert_intermediate1.data_ptr<float>(), count, intermediate_size_x2);
+        silu_and_mul(expert_intermediate1, count, intermediate_size_x2);
 
-        // GEMM 2: down_proj
-        gemm_q8_0_aten_parallel_packed(
+        // Quantize Intermediate
+        quantize_pack_A_parallel_q8_0<float>(
+            count, intermediate_size,
+            expert_intermediate1, intermediate_size_x2,
+            A_qs_packed2, A_d_packed2
+        );
+        gemm_q8_0_compute_packed(
             count, hidden_dim, intermediate_size,
-            expert_intermediate1.data_ptr<float>(), intermediate_size_x2,  
-            down_proj_qs_stacked[exp_id].data_ptr<int8_t>(),
-            reinterpret_cast<const ggml_half*>(down_proj_d_stacked[exp_id].data_ptr<at::Half>()),
-            expert_intermediate2.data_ptr<float>()
+            A_qs_packed2, A_d_packed2,
+            down_proj_qs_ptr,
+            reinterpret_cast<const ggml_half*>(down_proj_d_ptr),
+            expert_intermediate2 + start_pos * hidden_dim,
+            hidden_dim
         );
     }
 
     T* final_output_ptr = x.data_ptr<T>();
     const T* routing_weights_ptr = routing_weights.data_ptr<T>();
-    const float* intermediate_act2_ptr = intermediate_act2.data_ptr<float>();
 
-    // Token-centric Parallel Aggregation (Scatter): 从 float 转换回 T
+    // Token-centric Parallel Aggregation (Scatter)
     at::parallel_for(0, num_tokens, 0, [&](int64_t start, int64_t end) {
         std::vector<float> acc_buffer(hidden_dim, 0.0f);
         for (int64_t t = start; t < end; ++t) {
@@ -690,16 +782,13 @@ torch::Tensor moe_q8_forward_impl(
                 const int src_row_idx = scatter_map[scatter_idx];
                 if (src_row_idx == -1) continue;
 
-                // 从 T 转换为 float 来计算
                 const float weight = static_cast<float>(routing_weights_ptr[scatter_idx]);
-                const float* src_row = intermediate_act2_ptr + src_row_idx * hidden_dim;
+                const float* src_row = expert_intermediate2 + src_row_idx * hidden_dim;
 
-                // 在 float32 累加
                 for (int j = 0; j < hidden_dim; ++j) {
                     acc_buffer[j] += weight * src_row[j];
                 }
             }
-            // 将累加结果从 float 转换回 T 并写入输出张量
             T* dst_row = final_output_ptr + t * hidden_dim;
             const float* src_row_acc = acc_buffer.data();
             for (int j = 0; j < hidden_dim; ++j) {
@@ -707,9 +796,86 @@ torch::Tensor moe_q8_forward_impl(
             }
         }
     });
+
+    std::free(A_qs_packed1);
+    std::free(A_d_packed1);
+    std::free(A_qs_packed2);
+    std::free(A_d_packed2);
+    std::free(expert_intermediate1);
+    std::free(expert_intermediate2);
     
     return x;
 }
+
+// 用于存储每个形状的计时信息
+struct TimingInfo {
+    double total_duration_ms = 0.0;
+    long long call_count = 0;
+};
+
+// 将张量形状（vector）转换为可读的字符串
+std::string shape_to_string(const std::vector<int64_t>& shape) {
+    std::stringstream ss;
+    ss << "[";
+    for (size_t i = 0; i < shape.size(); ++i) {
+        ss << shape[i] << (i == shape.size() - 1 ? "" : ", ");
+    }
+    ss << "]";
+    return ss.str();
+}
+
+// Profiler类，用于记录和打印耗时
+class MoeProfiler {
+public:
+    // 构造函数和析构函数现在为空
+    MoeProfiler() = default;
+    ~MoeProfiler() = default;
+
+    // 记录一次函数调用的耗时
+    void record(const std::vector<int64_t>& shape, double duration_ms) {
+        // 由于是单线程，不需要加锁
+        auto& info = timings_[shape]; // 如果shape不存在，会自动创建
+        info.total_duration_ms += duration_ms;
+        info.call_count++;
+    }
+
+    // 打印统计结果的函数
+    void print_summary() {
+        std::cout << "\n--- MoE Forward Pass Profiling Summary ---\n";
+        std::cout << std::left << std::setw(25) << "Input Shape"
+                  << std::setw(15) << "Call Count"
+                  << std::setw(20) << "Total Time (ms)"
+                  << std::setw(20) << "Average Time (ms)"
+                  << "\n";
+        std::cout << std::string(80, '-') << "\n";
+
+        for (const auto& pair : timings_) {
+            const auto& shape = pair.first;
+            const auto& info = pair.second;
+            if (info.call_count == 0) continue;
+            double avg_duration = info.total_duration_ms / info.call_count;
+            
+            std::cout << std::left << std::setw(25) << shape_to_string(shape)
+                      << std::setw(15) << info.call_count
+                      << std::fixed << std::setprecision(4)
+                      << std::setw(20) << info.total_duration_ms
+                      << std::setw(20) << avg_duration
+                      << "\n";
+        }
+        std::cout << "------------------------------------------\n" << std::endl;
+    }
+
+private:
+    std::map<std::vector<int64_t>, TimingInfo> timings_;
+};
+
+// 创建一个静态（但非全局析构）的Profiler实例。
+// 它在第一次被访问时初始化，并存活到程序结束。
+static MoeProfiler& get_profiler() {
+    static MoeProfiler instance;
+    return instance;
+}
+
 
 // 调度器函数，Pybind将绑定到此函数
 torch::Tensor moe_q8_forward(
@@ -724,27 +890,41 @@ torch::Tensor moe_q8_forward(
     // 检查输入和权重是否具有相同的dtype
     TORCH_CHECK(x.scalar_type() == routing_weights.scalar_type(), 
                 "x and routing_weights must have the same dtype");
+
+    auto start = std::chrono::high_resolution_clock::now();
     
+    torch::Tensor result;
+
     // 根据输入类型调用相应的模板实例
     if (x.scalar_type() == torch::kFloat) {
-        return moe_q8_forward_impl<float>(
+        result = moe_q8_forward_impl<float>(
             x, routing_weights, selected_experts, gate_up_qs_stacked,
             gate_up_d_stacked, down_proj_qs_stacked, down_proj_d_stacked);
     } else if (x.scalar_type() == torch::kBFloat16) {
-        return moe_q8_forward_impl<at::BFloat16>(
+        result = moe_q8_forward_impl<at::BFloat16>(
             x, routing_weights, selected_experts, gate_up_qs_stacked,
             gate_up_d_stacked, down_proj_qs_stacked, down_proj_d_stacked);
     } else if (x.scalar_type() == torch::kHalf) {
-        return moe_q8_forward_impl<at::Half>(
+        result = moe_q8_forward_impl<at::Half>(
             x, routing_weights, selected_experts, gate_up_qs_stacked,
             gate_up_d_stacked, down_proj_qs_stacked, down_proj_d_stacked);
     } else {
         TORCH_CHECK(false, "Unsupported input dtype for moe_q8_forward. Supported dtypes are float32, bfloat16, and float16.");
     }
+
+    auto end = std::chrono::high_resolution_clock::now();
+    std::chrono::duration<double, std::milli> duration_ms = end - start;
+
+    // 使用静态实例记录信息
+    get_profiler().record(x.sizes().vec(), duration_ms.count());
+    return result;
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("quantize_repack_weight", &quantize_repack_weight, "Quantize and repack weight for q8_gemm");
     m.def("q8_gemm", &q8_gemm, "q8_gemm kernel (A_fp32 @ B_q8.T)");
     m.def("moe_q8_forward", &moe_q8_forward, "Full MoE expert forward pass with int8 GEMM on CPU for float, bfloat16, and float16 inputs");
+    m.add_object("_profiler_cleanup_hook", py::capsule([]() {
+        get_profiler().print_summary();
+    }));
 }

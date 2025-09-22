@@ -7,7 +7,7 @@ from nanovllm import LLM, SamplingParams
 def benchmark(llm: LLM, batch_size: int):
     num_seqs = batch_size
     max_input_len = 1
-    max_ouput_len = 256
+    max_ouput_len = 128
 
     prompt_token_ids = [[randint(0, 10000) for _ in  range(max_input_len)] for _ in range(num_seqs)]
     sampling_params = [SamplingParams(temperature=0.6, ignore_eos=True, max_tokens=max_ouput_len) for _ in range(num_seqs)]
@@ -24,10 +24,10 @@ def benchmark(llm: LLM, batch_size: int):
 
 def main():
     seed(0)
-    path = os.path.expanduser("/root/autodl-tmp/OLMoE-1B-7B-0924/")
+    path = os.path.expanduser("~/autodl-tmp/Qwen3-30B-A3B-Instruct-2507")
     # enforce_eager = True to disable cuda graph
     llm = LLM(path, enforce_eager=True, max_model_len=4096)
-    for batch_size in [1, 2, 4, 8, 16, 32, 64, 128, 256]:
+    for batch_size in [1]:
         print(f"Batch size: {batch_size}")
         benchmark(llm, batch_size)
         print()

@@ -34,7 +34,7 @@ class RotaryEmbedding(nn.Module):
         cos_sin_cache = torch.cat((cos_full, sin_full), dim=-1)
 
         # 4. 注册为单个 buffer
-        self.register_buffer("cos_sin_cache", cos_sin_cache.unsqueeze_(1).unsqueeze_(1), persistent=False)
+        self.register_buffer("cos_sin_cache", cos_sin_cache.reshape(max_position_embeddings, 1, 1, 2 * rotary_dim), persistent=False)
 
     def forward(
         self,
@@ -49,16 +49,16 @@ class RotaryEmbedding(nn.Module):
         cos = rope[..., :self.head_size]
         sin = rope[..., self.head_size:]
 
-        query = query.unsqueeze_(1)
-        key = key.unsqueeze_(1)
+        query = query.unsqueeze(1)
+        key = key.unsqueeze(1)
 
         # query, key 形状: [total_tokens, 1, num_heads, head_dim]
         # cos, sin 形状: [total_tokens, 1, 1, head_dim]
         query_out, key_out = torch_npu.npu_apply_rotary_pos_emb(query, key, cos, sin)
 
         # 移除插入的维度
-        query_out = query_out.squeeze_(1)
-        key_out = key_out.squeeze_(1)
+        query_out = query_out.squeeze(1)
+        key_out = key_out.squeeze(1)
 
         return query_out, key_out
 
