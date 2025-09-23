@@ -891,7 +891,7 @@ torch::Tensor moe_q8_forward(
     TORCH_CHECK(x.scalar_type() == routing_weights.scalar_type(), 
                 "x and routing_weights must have the same dtype");
 
-    auto start = std::chrono::high_resolution_clock::now();
+    // auto start = std::chrono::high_resolution_clock::now();
     
     torch::Tensor result;
 
@@ -912,11 +912,11 @@ torch::Tensor moe_q8_forward(
         TORCH_CHECK(false, "Unsupported input dtype for moe_q8_forward. Supported dtypes are float32, bfloat16, and float16.");
     }
 
-    auto end = std::chrono::high_resolution_clock::now();
-    std::chrono::duration<double, std::milli> duration_ms = end - start;
+    // auto end = std::chrono::high_resolution_clock::now();
+    // std::chrono::duration<double, std::milli> duration_ms = end - start;
 
     // 使用静态实例记录信息
-    get_profiler().record(x.sizes().vec(), duration_ms.count());
+    // get_profiler().record(x.sizes().vec(), duration_ms.count());
     return result;
 }
 
@@ -924,7 +924,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("quantize_repack_weight", &quantize_repack_weight, "Quantize and repack weight for q8_gemm");
     m.def("q8_gemm", &q8_gemm, "q8_gemm kernel (A_fp32 @ B_q8.T)");
     m.def("moe_q8_forward", &moe_q8_forward, "Full MoE expert forward pass with int8 GEMM on CPU for float, bfloat16, and float16 inputs");
-    m.add_object("_profiler_cleanup_hook", py::capsule([]() {
-        get_profiler().print_summary();
-    }));
+    // m.add_object("_profiler_cleanup_hook", py::capsule([]() {
+    //     get_profiler().print_summary();
+    // }));
 }

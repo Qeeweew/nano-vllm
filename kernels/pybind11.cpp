@@ -79,10 +79,6 @@ std::tuple<at::Tensor, at::Tensor> run_rope_custom(
     const uint32_t head_size = query.size(2);
     const uint32_t max_positions = cos_sin_cache.size(0);
 
-    // The kernel needs batch and seq_len. Since we receive flattened tokens,
-    // we assume a batch size of 1 for simplicity, or it should be passed from python.
-    // For paged attention style inference, num_tokens is the effective batch size.
-
     // Create output tensors
     auto output_query = at::empty_like(query);
     auto output_key = at::empty_like(key);
@@ -123,6 +119,21 @@ std::tuple<at::Tensor, at::Tensor> run_rope_custom(
 PYBIND11_MODULE(nanovllm_kernels, m)
 {
     m.doc() = "Custom Ascend C kernel pybind11 interfaces";
-    m.def("run_store_kvcache", &my_ops::run_store_kvcache, "Store key and value tensors into KV cache");
-    m.def("run_rope_custom", &my_ops::run_rope_custom, "Apply Rotary Positional Embedding (RoPE) to query and key");
+
+    m.def("run_store_kvcache",
+          &my_ops::run_store_kvcache,
+          "Store key and value tensors into KV cache",
+          py::arg("key"),
+          py::arg("value"),
+          py::arg("k_cache"),
+          py::arg("v_cache"),
+          py::arg("slot_mapping"));
+
+    m.def("run_rope_custom",
+          &my_ops::run_rope_custom,
+          "Apply Rotary Positional Embedding (RoPE) to query and key (out-of-place)",
+          py::arg("query"),
+          py::arg("key"),
+          py::arg("positions"),
+          py::arg("cos_sin_cache"));
 }

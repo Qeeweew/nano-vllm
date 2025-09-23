@@ -14,7 +14,7 @@ def main():
 
     sampling_params = SamplingParams(temperature=0, max_tokens=4)
     prompts = [
-        "Bitcoin is",
+        "Bitcoin is"
     ]
     # prompts = [
     #     tokenizer.apply_chat_template(
@@ -25,7 +25,7 @@ def main():
     #     for prompt in prompts
     # ]
     print("Warm-up run...")
-    _ = llm.generate(prompts, SamplingParams(temperature=0, max_tokens=1))
+    _ = llm.generate(["test"], SamplingParams(temperature=0, max_tokens=1))
 
     # print("Warm-up finished. Starting profiling...")
     
@@ -60,7 +60,7 @@ def main():
 
     # 打印 profiler 总结信息到控制台
 
-    outputs = llm.generate(prompts, sampling_params, use_tqdm=True)
+    # outputs = llm.generate(prompts, sampling_params, use_tqdm=True)
 
     # 打印正常输出
     for prompt, output in zip(prompts, outputs):
