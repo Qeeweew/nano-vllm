@@ -22,4 +22,5 @@ include(${ASCENDC_CMAKE_DIR}/ascendc.cmake)
 # This will create libkernels.a and the aclrtlaunch_store_kvcache.h header
 ascendc_library(kernels STATIC
     store_kvcache.cpp
+    rotary_embending.cpp
 )
