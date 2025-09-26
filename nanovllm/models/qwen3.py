@@ -101,11 +101,9 @@ class Qwen3MLP(nn.Module):
         self.act_fn = SiluAndMul()
 
     def forward(self, x: torch.Tensor):
-
-        gate_up = self.gate_up_proj(x_cpu)
-        x_cpu = self.act_fn(gate_up)
-        x_cpu = self.down_proj(x_cpu)
-
+        gate_up = self.gate_up_proj(x)
+        x = self.act_fn(gate_up)
+        x = self.down_proj(x)
         return x
 
 
