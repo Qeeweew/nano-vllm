@@ -77,12 +77,13 @@ std::tuple<at::Tensor, at::Tensor> run_rope_custom(
     const uint32_t num_tokens = query.size(0);
     const uint32_t num_heads = query.size(1);
     const uint32_t head_size = query.size(2);
+    const uint32_t num_kv_heads = key.size(1);
     const uint32_t max_positions = cos_sin_cache.size(0);
 
     // Create output tensors
     auto output_query = at::empty_like(query);
     auto output_key = at::empty_like(key);
-    const uint32_t blockDim = std::min((uint32_t)num_tokens * num_heads, (uint32_t)24);
+    const uint32_t blockDim = std::min((uint32_t)num_tokens, (uint32_t)24);
 
     // Dispatch to the correct kernel based on dtype
     if (query.dtype() == torch::kFloat16) {
@@ -94,7 +95,7 @@ std::tuple<at::Tensor, at::Tensor> run_rope_custom(
          const_cast<void *>(cos_sin_cache.data_ptr()),
          output_query.data_ptr(),
          output_key.data_ptr(),
-         num_tokens, num_heads, head_size, max_positions
+         num_tokens, num_heads, num_kv_heads, head_size, max_positions
         );
     } else if (query.dtype() == torch::kBFloat16) {
         ACLRT_LAUNCH_KERNEL(rope_custom_bf16)
@@ -105,7 +106,7 @@ std::tuple<at::Tensor, at::Tensor> run_rope_custom(
          const_cast<void *>(cos_sin_cache.data_ptr()),
          output_query.data_ptr(),
          output_key.data_ptr(),
-         num_tokens, num_heads, head_size, max_positions
+         num_tokens, num_heads, num_kv_heads, head_size, max_positions
         );
     } else {
         TORCH_CHECK(false, "Unsupported dtype for RoPE kernel");
