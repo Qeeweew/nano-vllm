@@ -1,4 +1,3 @@
-# FILE: ./nanovllm/layers/quantized_linear.py
 import torch
 from torch import nn
 import nanovllm_ext  # This will be built by setup.py

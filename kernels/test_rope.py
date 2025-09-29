@@ -86,8 +86,9 @@ def run_test(dtype, device):
     print(f"\n--- Running test for dtype={dtype} on device={device} ---")
 
     # --- 参数定义 ---
-    num_tokens = 128
+    num_tokens = 128 
     num_heads = 32
+    kv_num_heads = 4
     head_dim = 128
     max_position = 4096
     base = 10000.0
@@ -95,7 +96,7 @@ def run_test(dtype, device):
     # --- 生成输入数据 ---
     # query 和 key 是 3D 张量
     query_in = torch.randn(num_tokens, num_heads, head_dim, dtype=dtype, device=device).contiguous()
-    key_in = torch.randn(num_tokens, num_heads, head_dim, dtype=dtype, device=device).contiguous()
+    key_in = torch.randn(num_tokens, kv_num_heads, head_dim, dtype=dtype, device=device).contiguous()
     
     # positions 是 1D int64 张量
     # 模拟一个非连续的 token position 序列，这在 KV 缓存中很常见
@@ -126,9 +127,6 @@ def run_test(dtype, device):
         cos_sin_cache      # 第四个参数
     )
 
-    print(custom_query)
-    print(custom_key)
-    
     # --- 3. 比较结果 ---
     print("\nComparing outputs...")
 

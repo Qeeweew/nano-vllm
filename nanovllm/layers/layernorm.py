@@ -1,6 +1,7 @@
 import torch
 from torch import nn
 import torch_npu
+from nanovllm_kernels import run_rmsnorm
 
 
 class RMSNorm(nn.Module):
@@ -22,5 +23,5 @@ class RMSNorm(nn.Module):
         if residual is not None:
             x, _, residual = torch_npu.npu_add_rms_norm(x, residual, self.weight, self.eps)
             return x, residual
-        x, _ = torch_npu.npu_rms_norm(x, self.weight, self.eps)
+        x = run_rmsnorm(x, self.weight, self.eps)
         return x

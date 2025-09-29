@@ -11,8 +11,10 @@
 #include <torch/extension.h>
 #include <tuple>
 #include "aclrtlaunch_store_kvcache.h"
-#include "aclrtlaunch_rope_custom_fp16.h" // Include the new generated header
-#include "aclrtlaunch_rope_custom_bf16.h" // Include the new generated header
+#include "aclrtlaunch_rope_custom_fp16.h"
+#include "aclrtlaunch_rope_custom_bf16.h"
+#include "aclrtlaunch_rmsnorm_fp16.h"
+#include "aclrtlaunch_rmsnorm_bf16.h"
 #include "torch_npu/csrc/core/npu/NPUStream.h"
 
 namespace my_ops {
@@ -115,6 +117,116 @@ std::tuple<at::Tensor, at::Tensor> run_rope_custom(
     return std::make_tuple(output_query, output_key);
 }
 
+at::Tensor run_rmsnorm(
+    const at::Tensor &x,
+    const at::Tensor &weight,
+    float eps
+) {
+    // Input validation
+    // TORCH_CHECK(x.dim() == 2, "Input x must be a 2D tensor (num_tokens, hidden_size)");
+    TORCH_CHECK(weight.dim() == 1, "Weight must be a 1D tensor (hidden_size)");
+    // TORCH_CHECK(x.size(1) == weight.size(0), "x.size(1) must match weight.size(0)");
+    
+    TORCH_CHECK(x.dtype() == torch::kFloat16 || x.dtype() == torch::kBFloat16, "Input x must be float16 or bfloat16");
+    TORCH_CHECK(x.dtype() == weight.dtype(), "Input x and weight must have the same dtype");
+
+    // TORCH_CHECK(x.is_contiguous(), "Input x tensor must be contiguous");
+    TORCH_CHECK(weight.is_contiguous(), "Weight tensor must be contiguous");
+
+    auto acl_stream = c10_npu::getCurrentNPUStream();
+
+    const uint32_t hidden_size = weight.size(0);
+    at::Tensor x_contiguous = x.contiguous();
+    auto x_2d = x_contiguous.view({-1, hidden_size});
+
+    // Extract dimensions
+    const uint32_t batch = x_2d.size(0);
+
+    // Create output tensor
+    auto output = at::empty_like(x);
+
+    // Use a small blockDim, as each core handles entire rows.
+    // Parallelism is across the token dimension.
+    const uint32_t blockDim = std::min((uint32_t)batch, (uint32_t)24);
+
+    // Dispatch to the correct kernel based on dtype
+    if (x.dtype() == torch::kFloat16) {
+        ACLRT_LAUNCH_KERNEL(rmsnorm_fp16)
+        (blockDim, acl_stream,
+         const_cast<void *>(x_2d.data_ptr()),
+         const_cast<void *>(weight.data_ptr()),
+         output.data_ptr(),
+         batch, hidden_size, eps, 1.0f / hidden_size
+        );
+    } else if (x.dtype() == torch::kBFloat16) {
+        ACLRT_LAUNCH_KERNEL(rmsnorm_bf16)
+        (blockDim, acl_stream,
+         const_cast<void *>(x_2d.data_ptr()),
+         const_cast<void *>(weight.data_ptr()),
+         output.data_ptr(),
+         batch, hidden_size, eps, 1.0f / hidden_size
+        );
+    } else {
+        TORCH_CHECK(false, "Unsupported dtype for RMSNorm kernel");
+    }
+
+    return output;
+}
+
+std::tuple<at::Tensor, at::Tensor> run_norm_rope(
+    const at::Tensor& q_in,
+    const at::Tensor& k_in,
+    const at::Tensor& q_norm_weight,
+    const at::Tensor& k_norm_weight,
+    float q_norm_eps,
+    float k_norm_eps,
+    const at::Tensor& positions,
+    const at::Tensor& cos_sin_cache,
+    int64_t num_q_heads,
+    int64_t num_kv_heads,
+    int64_t head_dim,
+    bool norm_before_reshape
+) {
+    // --- Input Validation ---
+    TORCH_CHECK(q_in.dim() == 2, "Input q must be a 2D tensor (num_tokens, q_size)");
+    TORCH_CHECK(k_in.dim() == 2, "Input k must be a 2D tensor (num_tokens, kv_size)");
+    TORCH_CHECK(q_norm_weight.dim() == 1, "q_norm_weight must be 1D");
+    TORCH_CHECK(k_norm_weight.dim() == 1, "k_norm_weight must be 1D");
+    TORCH_CHECK(q_in.dtype() == k_in.dtype(), "q and k must have the same dtype");
+    TORCH_CHECK(q_in.dtype() == q_norm_weight.dtype(), "q and q_norm_weight must have the same dtype");
+    TORCH_CHECK(k_in.dtype() == k_norm_weight.dtype(), "k and k_norm_weight must have the same dtype");
+
+    // Tensors that will be passed to run_rope_custom
+    at::Tensor q_for_rope;
+    at::Tensor k_for_rope;
+
+    if (norm_before_reshape) {
+        // --- Olmoe Style ---
+        // 1. Apply RMSNorm on the 2D input tensors.
+        auto q_norm_out = run_rmsnorm(q_in, q_norm_weight, q_norm_eps);
+        auto k_norm_out = run_rmsnorm(k_in, k_norm_weight, k_norm_eps);
+
+        // 2. Reshape the normalized tensors to 3D for RoPE.
+        q_for_rope = q_norm_out.view({-1, num_q_heads, head_dim});
+        k_for_rope = k_norm_out.view({-1, num_kv_heads, head_dim});
+    } else {
+        // --- Qwen3 Style ---
+        // 1. Reshape the input tensors to 3D first.
+        auto q_reshaped = q_in.view({-1, num_q_heads, head_dim});
+        auto k_reshaped = k_in.view({-1, num_kv_heads, head_dim});
+
+        // 2. Apply RMSNorm on the 3D tensors. The run_rmsnorm function
+        // internally handles reshaping to 2D for the kernel.
+        q_for_rope = run_rmsnorm(q_reshaped, q_norm_weight, q_norm_eps);
+        k_for_rope = run_rmsnorm(k_reshaped, k_norm_weight, k_norm_eps);
+    }
+    
+    // 3. Apply RoPE on the prepared 3D tensors.
+    // The run_rope_custom function will return the final q and k.
+    return run_rope_custom(q_for_rope, k_for_rope, positions, cos_sin_cache);
+}
+
+
 } // namespace my_ops
 
 PYBIND11_MODULE(nanovllm_kernels, m)
@@ -137,4 +249,28 @@ PYBIND11_MODULE(nanovllm_kernels, m)
           py::arg("key"),
           py::arg("positions"),
           py::arg("cos_sin_cache"));
+
+    m.def("run_rmsnorm",
+          &my_ops::run_rmsnorm,
+          "Apply Root Mean Square Normalization (RMSNorm)",
+          py::arg("x"),
+          py::arg("weight"),
+          py::arg("eps"));
+
+    m.def("run_norm_rope",
+          &my_ops::run_norm_rope,
+          "Fused operation for RMSNorm and Rotary Positional Embedding (RoPE)",
+          py::arg("q_in"),
+          py::arg("k_in"),
+          py::arg("q_norm_weight"),
+          py::arg("k_norm_weight"),
+          py::arg("q_norm_eps"),
+          py::arg("k_norm_eps"),
+          py::arg("positions"),
+          py::arg("cos_sin_cache"),
+          py::arg("num_q_heads"),
+          py::arg("num_kv_heads"),
+          py::arg("head_dim"),
+          py::arg("norm_before_reshape")
+    );
 }

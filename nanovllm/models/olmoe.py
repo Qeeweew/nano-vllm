@@ -12,6 +12,7 @@ from nanovllm.layers.linear import QKVParallelLinear, Linear, CPULinear, MergedC
 from nanovllm.layers.rotary_embedding import get_rope
 from nanovllm.layers.embed_head import VocabParallelEmbedding, ParallelLMHead
 from nanovllm.utils.context import get_context
+from nanovllm_kernels import run_norm_rope
 
 class OlmoeAttention(nn.Module):
     def __init__(
@@ -57,6 +58,9 @@ class OlmoeAttention(nn.Module):
         # Olmoe has specific q_norm and k_norm
         self.q_norm = RMSNorm(self.num_heads * self.head_dim, eps=config.rms_norm_eps)
         self.k_norm = RMSNorm(self.num_kv_heads * self.head_dim, eps=config.rms_norm_eps)
+        
+        self.q_norm_eps = config.rms_norm_eps
+        self.k_norm_eps = config.rms_norm_eps
 
     def forward(
         self,
@@ -66,17 +70,27 @@ class OlmoeAttention(nn.Module):
         qkv = self.qkv_proj(hidden_states)
         q_size = self.num_heads * self.head_dim
         kv_size = self.num_kv_heads * self.head_dim
-        q, k, v = qkv.split([q_size, kv_size, kv_size], dim=-1)
+        q_unnorm, k_unnorm, v = qkv.split([q_size, kv_size, kv_size], dim=-1)
 
-        # Apply Q/K norm
-        q = self.q_norm(q)
-        k = self.k_norm(k)
+        # --- FUSED KERNEL CALL ---
+        # No need for .to(torch.float32) as the cache is already float32
+        q, k = run_norm_rope(
+            q_in=q_unnorm,
+            k_in=k_unnorm,
+            q_norm_weight=self.q_norm.weight,
+            k_norm_weight=self.k_norm.weight,
+            q_norm_eps=self.q_norm_eps,
+            k_norm_eps=self.k_norm_eps,
+            positions=positions,
+            cos_sin_cache=self.rotary_emb.cos_sin_cache,
+            num_q_heads=self.num_heads,
+            num_kv_heads=self.num_kv_heads,
+            head_dim=self.head_dim,
+            norm_before_reshape=True,
+        )
+        # --- END OF FUSED KERNEL CALL ---
 
-        q = q.view(-1, self.num_heads, self.head_dim)
-        k = k.view(-1, self.num_kv_heads, self.head_dim)
         v = v.view(-1, self.num_kv_heads, self.head_dim)
-
-        q, k = self.rotary_emb(positions, q, k)
         o = self.attn(q, k, v)
         output = self.o_proj(o.flatten(1, -1))
         return output

@@ -8,7 +8,7 @@ from nanovllm.layers.layernorm import RMSNorm
 from nanovllm.layers.linear import QKVParallelLinear, MergedLinear, Linear
 from nanovllm.layers.rotary_embedding import get_rope
 from nanovllm.layers.embed_head import VocabParallelEmbedding, ParallelLMHead
-
+from nanovllm_kernels import run_norm_rope
 
 class Qwen3Attention(nn.Module):
 
@@ -61,19 +61,49 @@ class Qwen3Attention(nn.Module):
         )
         self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
         self.k_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
+        
+        # Store eps values for the kernel call
+        self.q_norm_eps = rms_norm_eps
+        self.k_norm_eps = rms_norm_eps
 
     def forward(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
+        # 1. Project to get Q, K, V in a single large tensor.
         qkv = self.qkv_proj(hidden_states)
-        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        q = self.q_norm(q.view(-1, self.num_heads, self.head_dim))
-        k = self.k_norm(k.view(-1, self.num_kv_heads, self.head_dim))
+
+        # 2. Split the tensor into Q, K, and V parts.
+        # These are still 2D: (num_tokens, total_q_size or total_kv_size).
+        q_unnorm, k_unnorm, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        
+        # 3. Use the fused C++ kernel to perform Norm and RoPE.
+        # This single call replaces the sequence of: q.view -> q_norm -> k.view -> k_norm -> rotary_emb.
+        # We set `norm_before_reshape=False` to match the Qwen3 architecture, where
+        # the logical operation is view -> norm. The C++ wrapper will handle this sequence.
+        q, k = run_norm_rope(
+            q_in=q_unnorm,
+            k_in=k_unnorm,
+            q_norm_weight=self.q_norm.weight,
+            k_norm_weight=self.k_norm.weight,
+            q_norm_eps=self.q_norm_eps,
+            k_norm_eps=self.k_norm_eps,
+            positions=positions,
+            cos_sin_cache=self.rotary_emb.cos_sin_cache,
+            num_q_heads=self.num_heads,
+            num_kv_heads=self.num_kv_heads,
+            head_dim=self.head_dim,
+            norm_before_reshape=False,
+        )
+        
+        # 4. Reshape V to be 3D for the attention mechanism.
         v = v.view(-1, self.num_kv_heads, self.head_dim)
-        q, k = self.rotary_emb(positions, q, k)
+        
+        # 5. Perform attention.
         o = self.attn(q, k, v)
+        
+        # 6. Final output projection.
         output = self.o_proj(o.flatten(1, -1))
         return output
 
