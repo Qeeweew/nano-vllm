@@ -15,6 +15,8 @@
 #include "aclrtlaunch_rope_custom_bf16.h"
 #include "aclrtlaunch_rmsnorm_fp16.h"
 #include "aclrtlaunch_rmsnorm_bf16.h"
+#include "aclrtlaunch_add_rmsnorm_fp16.h"
+#include "aclrtlaunch_add_rmsnorm_bf16.h"
 #include "torch_npu/csrc/core/npu/NPUStream.h"
 
 namespace my_ops {
@@ -123,54 +125,143 @@ at::Tensor run_rmsnorm(
     float eps
 ) {
     // Input validation
-    // TORCH_CHECK(x.dim() == 2, "Input x must be a 2D tensor (num_tokens, hidden_size)");
+    TORCH_CHECK(x.dim() == 2 || x.dim() == 3, "Input x must be a 2D or 3D tensor");
     TORCH_CHECK(weight.dim() == 1, "Weight must be a 1D tensor (hidden_size)");
-    // TORCH_CHECK(x.size(1) == weight.size(0), "x.size(1) must match weight.size(0)");
+    TORCH_CHECK(x.size(-1) == weight.size(0), "Last dimension of x must match weight size");
     
     TORCH_CHECK(x.dtype() == torch::kFloat16 || x.dtype() == torch::kBFloat16, "Input x must be float16 or bfloat16");
     TORCH_CHECK(x.dtype() == weight.dtype(), "Input x and weight must have the same dtype");
-
-    // TORCH_CHECK(x.is_contiguous(), "Input x tensor must be contiguous");
     TORCH_CHECK(weight.is_contiguous(), "Weight tensor must be contiguous");
 
     auto acl_stream = c10_npu::getCurrentNPUStream();
+    
+    // Create a contiguous output tensor with the same shape as input x.
+    auto output = at::empty(x.sizes(), x.options());
 
-    const uint32_t hidden_size = weight.size(0);
-    at::Tensor x_contiguous = x.contiguous();
-    auto x_2d = x_contiguous.view({-1, hidden_size});
+    // Extract dimensions and strides, treating 2D as a special case of 3D
+    const uint32_t hidden_size = x.size(-1);
+    uint32_t num_tokens, num_heads;
+    uint32_t x_stride0, x_stride1;
 
-    // Extract dimensions
-    const uint32_t batch = x_2d.size(0);
+    if (x.dim() == 2) {
+        // Shape: (num_tokens, hidden_size)
+        num_tokens = x.size(0);
+        num_heads = 1;
+        x_stride0 = x.stride(0);
+        x_stride1 = x.stride(0);
+    } else { // x.dim() == 3
+        // Shape: (num_tokens, num_heads, hidden_size)
+        num_tokens = x.size(0);
+        num_heads = x.size(1);
+        x_stride0 = x.stride(0);
+        x_stride1 = x.stride(1);
+    }
+    
+    // Total number of rows to process (each row is a vector of size hidden_size)
+    const uint32_t num_rows = num_tokens * num_heads;
 
-    // Create output tensor
-    auto output = at::empty_like(x);
+    // Parallelize across the combined (tokens * heads) dimension
+    const uint32_t blockDim = std::min((uint32_t)num_rows, (uint32_t)24);
 
-    // Use a small blockDim, as each core handles entire rows.
-    // Parallelism is across the token dimension.
-    const uint32_t blockDim = std::min((uint32_t)batch, (uint32_t)24);
-
+    if (blockDim == 0) {
+        return output; // Handle empty input
+    }
+    
     // Dispatch to the correct kernel based on dtype
     if (x.dtype() == torch::kFloat16) {
         ACLRT_LAUNCH_KERNEL(rmsnorm_fp16)
         (blockDim, acl_stream,
-         const_cast<void *>(x_2d.data_ptr()),
+         const_cast<void *>(x.data_ptr()),
          const_cast<void *>(weight.data_ptr()),
          output.data_ptr(),
-         batch, hidden_size, eps, 1.0f / hidden_size
+         num_rows, num_heads, hidden_size,
+         x_stride0, x_stride1,
+         eps, 1.0f / hidden_size
         );
     } else if (x.dtype() == torch::kBFloat16) {
         ACLRT_LAUNCH_KERNEL(rmsnorm_bf16)
         (blockDim, acl_stream,
-         const_cast<void *>(x_2d.data_ptr()),
+         const_cast<void *>(x.data_ptr()),
          const_cast<void *>(weight.data_ptr()),
          output.data_ptr(),
-         batch, hidden_size, eps, 1.0f / hidden_size
+         num_rows, num_heads, hidden_size,
+         x_stride0, x_stride1,
+         eps, 1.0f / hidden_size
         );
     } else {
         TORCH_CHECK(false, "Unsupported dtype for RMSNorm kernel");
     }
 
     return output;
+}
+
+std::tuple<at::Tensor, at::Tensor> run_add_rmsnorm(
+    const at::Tensor &x,
+    const at::Tensor &residual,
+    const at::Tensor &weight,
+    float eps
+) {
+    // Input validation
+    TORCH_CHECK(x.dim() == 2, "Input x must be a 2D tensor for add_rmsnorm");
+    TORCH_CHECK(residual.dim() == 2, "Input residual must be a 2D tensor for add_rmsnorm");
+    TORCH_CHECK(weight.dim() == 1, "Weight must be a 1D tensor");
+
+    TORCH_CHECK(x.sizes() == residual.sizes(), "x and residual must have the same shape");
+    TORCH_CHECK(x.size(1) == weight.size(0), "Last dimension of x must match weight size");
+    
+    TORCH_CHECK(x.is_contiguous(), "Input x must be contiguous");
+    TORCH_CHECK(residual.is_contiguous(), "Input residual must be contiguous");
+    TORCH_CHECK(weight.is_contiguous(), "Weight tensor must be contiguous");
+
+    TORCH_CHECK(x.dtype() == torch::kFloat16 || x.dtype() == torch::kBFloat16, "Inputs must be float16 or bfloat16");
+    TORCH_CHECK(x.dtype() == residual.dtype(), "x and residual must have the same dtype");
+    TORCH_CHECK(x.dtype() == weight.dtype(), "x and weight must have the same dtype");
+
+    auto acl_stream = c10_npu::getCurrentNPUStream();
+    
+    // Create output tensors
+    auto output = at::empty_like(x);
+    auto residual_out = at::empty_like(x);
+
+    // Extract dimensions
+    const uint32_t num_rows = x.size(0);
+    const uint32_t hidden_size = x.size(1);
+
+    if (num_rows == 0) {
+        return std::make_tuple(output, residual_out); // Handle empty input
+    }
+
+    // Parallelize across the rows
+    const uint32_t blockDim = std::min((uint32_t)num_rows, (uint32_t)24);
+    
+    // Dispatch to the correct kernel based on dtype
+    if (x.dtype() == torch::kFloat16) {
+        ACLRT_LAUNCH_KERNEL(add_rmsnorm_fp16)
+        (blockDim, acl_stream,
+            const_cast<void *>(x.data_ptr()),
+            const_cast<void *>(residual.data_ptr()),
+            const_cast<void *>(weight.data_ptr()),
+            output.data_ptr(),
+            residual_out.data_ptr(),
+            num_rows, hidden_size,
+            eps, 1.0f / hidden_size
+        );
+    } else if (x.dtype() == torch::kBFloat16) {
+        ACLRT_LAUNCH_KERNEL(add_rmsnorm_bf16)
+        (blockDim, acl_stream,
+            const_cast<void *>(x.data_ptr()),
+            const_cast<void *>(residual.data_ptr()),
+            const_cast<void *>(weight.data_ptr()),
+            output.data_ptr(),
+            residual_out.data_ptr(),
+            num_rows, hidden_size,
+            eps, 1.0f / hidden_size
+        );
+    } else {
+        TORCH_CHECK(false, "Unsupported dtype for Add RMSNorm kernel");
+    }
+
+    return std::make_tuple(output, residual_out);
 }
 
 std::tuple<at::Tensor, at::Tensor> run_norm_rope(
@@ -254,6 +345,14 @@ PYBIND11_MODULE(nanovllm_kernels, m)
           &my_ops::run_rmsnorm,
           "Apply Root Mean Square Normalization (RMSNorm)",
           py::arg("x"),
+          py::arg("weight"),
+          py::arg("eps"));
+
+    m.def("run_add_rmsnorm",
+          &my_ops::run_add_rmsnorm,
+          "Fused Add + Root Mean Square Normalization (RMSNorm)",
+          py::arg("x"),
+          py::arg("residual"),
           py::arg("weight"),
           py::arg("eps"));
 

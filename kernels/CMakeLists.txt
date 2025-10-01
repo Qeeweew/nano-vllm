@@ -23,4 +23,5 @@ include(${ASCENDC_CMAKE_DIR}/ascendc.cmake)
 ascendc_library(kernels STATIC
     store_kvcache.cpp
     rotary_embending.cpp
+    rms_norm.cpp
 )
