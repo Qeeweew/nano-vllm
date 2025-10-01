@@ -1017,7 +1017,7 @@ torch::Tensor moe_q8_forward_impl(
     // 5. SCATTER AND WEIGHTING (COMMON STEP)
     // =======================================================================
     T* final_output_ptr = x.data_ptr<T>();
-    const T* routing_weights_ptr = routing_weights.data_ptr<T>();
+    const float* routing_weights_ptr = routing_weights.data_ptr<float>();
 
     #pragma omp parallel for
     for (int64_t t = 0; t < num_tokens; ++t) {
@@ -1026,7 +1026,7 @@ torch::Tensor moe_q8_forward_impl(
             const int scatter_idx = t * top_k + k;
             const int src_row_idx = scatter_map[scatter_idx];
             if (src_row_idx == -1) continue;
-            const float weight = static_cast<float>(routing_weights_ptr[scatter_idx]);
+            const float weight = routing_weights_ptr[scatter_idx];
             const float* src_row = expert_intermediate2 + src_row_idx * hidden_dim;
             for (int j = 0; j < hidden_dim; ++j) {
                 acc_buffer[j] += weight * src_row[j];
@@ -1037,8 +1037,7 @@ torch::Tensor moe_q8_forward_impl(
             dst_row[j] = static_cast<T>(acc_buffer[j]);
         }
     }
-
-    // --- Cleanup ---
+        // --- Cleanup ---
     std::free(x_qs);
     std::free(x_d);
     std::free(expert_intermediate2);
@@ -1126,8 +1125,8 @@ torch::Tensor moe_q8_forward(
     torch::Tensor down_proj_d_stacked
 ) {
     // 检查输入和权重是否具有相同的dtype
-    TORCH_CHECK(x.scalar_type() == routing_weights.scalar_type(), 
-                "x and routing_weights must have the same dtype");
+    TORCH_CHECK(routing_weights.scalar_type() == torch::kFloat, 
+                "routing_weights must be float32");
 
     // auto start = std::chrono::high_resolution_clock::now();
     
@@ -1158,11 +1157,127 @@ torch::Tensor moe_q8_forward(
     return result;
 }
 
+inline float fast_exp(float x)
+{
+    union {uint32_t i;float f;} v;
+    v.i=(1<<23)*(1.4426950409*x+126.94201519f);
+    return v.f;
+}
+
+template <typename T>
+void gating_top_k_softmax_impl(
+    const torch::Tensor& logits,
+    int top_k,
+    bool normalize,
+    torch::Tensor& routing_weights_out, // 输出张量，现在强制为 float32
+    torch::Tensor& selected_experts_out // 输出张量
+) {
+    const int num_tokens = logits.size(0);
+    const int num_experts = logits.size(1);
+
+    const T* logits_ptr = logits.data_ptr<T>();
+    float* weights_ptr = routing_weights_out.data_ptr<float>(); // [修改] 指针类型改为 float*
+    int32_t* experts_ptr = selected_experts_out.data_ptr<int32_t>();
+
+    #pragma omp parallel
+    {
+        // --- 线程私有缓冲区 ---
+        std::vector<int32_t> indices(num_experts);
+        std::vector<float> exp_vals(top_k);
+
+        #pragma omp for schedule(static)
+        for (int64_t i = 0; i < num_tokens; ++i) {
+            const T* current_logits = logits_ptr + i * num_experts;
+            
+            // 1. 初始化并部分排序索引以找到 top_k 专家
+            std::iota(indices.begin(), indices.end(), 0);
+            std::partial_sort(
+                indices.begin(),
+                indices.begin() + top_k,
+                indices.end(),
+                [&](int32_t a, int32_t b) {
+                    return static_cast<float>(current_logits[a]) > static_cast<float>(current_logits[b]);
+                }
+            );
+
+            // 2. 存储选择的专家索引
+            int32_t* current_experts = experts_ptr + i * top_k;
+            memcpy(current_experts, indices.data(), top_k * sizeof(int32_t));
+
+            // 3. 计算 Softmax 权重（现在总是在 float32 中进行）
+            float* current_weights = weights_ptr + i * top_k; // [修改] 指针类型改为 float*
+
+            if (normalize) {
+                // --- 路径 A: 仅在 TOP-K logits 上进行归一化 ---
+                
+                float max_logit = static_cast<float>(current_logits[indices[0]]);
+                
+                float sum_exp = 0.0f;
+                for (int k = 0; k < top_k; ++k) {
+                    exp_vals[k] = fast_exp(static_cast<float>(current_logits[indices[k]]) - max_logit);
+                    sum_exp += exp_vals[k];
+                }
+                
+                const float inv_sum_exp = (sum_exp > 0.0f) ? 1.0f / sum_exp : 0.0f;
+
+                for (int k = 0; k < top_k; ++k) {
+                    current_weights[k] = exp_vals[k] * inv_sum_exp;
+                }
+
+            } else {
+                // --- 路径 B: 在所有 logits 上进行标准 Softmax ---
+
+                float max_logit = -std::numeric_limits<float>::infinity();
+                for(int j=0; j < num_experts; ++j) {
+                    max_logit = std::max(max_logit, static_cast<float>(current_logits[j]));
+                }
+
+                float sum_exp = 0.0f;
+                for (int j = 0; j < num_experts; ++j) {
+                    sum_exp += fast_exp(static_cast<float>(current_logits[j]) - max_logit);
+                }
+
+                const float inv_sum_exp = (sum_exp > 0.0f) ? 1.0f / sum_exp : 0.0f;
+                
+                for (int k = 0; k < top_k; ++k) {
+                    float val = fast_exp(static_cast<float>(current_logits[indices[k]]) - max_logit);
+                    current_weights[k] = val * inv_sum_exp;
+                }
+            }
+        }
+    } // 结束并行区域
+}
+
+std::vector<torch::Tensor> gating_top_k_softmax(
+    const torch::Tensor& logits,
+    int top_k,
+    bool normalize
+) {
+    TORCH_CHECK(logits.dim() == 2, "Logits must be 2D");
+    TORCH_CHECK(logits.is_contiguous(), "Logits must be contiguous");
+    TORCH_CHECK(logits.device().is_cpu(), "Logits must be on CPU");
+    TORCH_CHECK(top_k > 0 && top_k <= logits.size(1), "top_k is out of range");
+
+    auto routing_weights_out = torch::empty({logits.size(0), top_k}, logits.options().dtype(torch::kFloat));
+    auto selected_experts_out = torch::empty({logits.size(0), top_k}, torch::kInt32);
+
+    if (logits.scalar_type() == torch::kHalf) {
+        gating_top_k_softmax_impl<at::Half>(logits, top_k, normalize, routing_weights_out, selected_experts_out);
+    } else if (logits.scalar_type() == torch::kBFloat16) {
+        gating_top_k_softmax_impl<at::BFloat16>(logits, top_k, normalize, routing_weights_out, selected_experts_out);
+    } else if (logits.scalar_type() == torch::kFloat) {
+        gating_top_k_softmax_impl<float>(logits, top_k, normalize, routing_weights_out, selected_experts_out);
+    } else {
+        TORCH_CHECK(false, "Unsupported dtype for gating_top_k_softmax. Supported: float16, bfloat16, float32.");
+    }
+
+    return {routing_weights_out, selected_experts_out};
+}
+
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("quantize_repack_weight", &quantize_repack_weight, "Quantize and repack weight for q8_gemm");
     m.def("q8_gemm", &q8_gemm, "q8_gemm kernel (A_fp32 @ B_q8.T)");
     m.def("moe_q8_forward", &moe_q8_forward, "Full MoE expert forward pass with int8 GEMM on CPU for float, bfloat16, and float16 inputs");
-    // m.add_object("_profiler_cleanup_hook", py::capsule([]() {
-    //     get_profiler().print_summary();
-    // }));
+    m.def("gating_top_k_softmax", &gating_top_k_softmax, "Perform Top-K and Softmax on CPU for MoE gating, returning new tensors");
 }

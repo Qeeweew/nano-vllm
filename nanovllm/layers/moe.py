@@ -6,15 +6,13 @@ from nanovllm.utils.context import get_context
 
 # Import the C++ extension for quantized MoE computation
 import nanovllm_ext
-import torch_npu
 
 class SparseMoeBlock(nn.Module):
     """
     Sparse MoE block with CPU offloading for experts.
     The router (gate) runs on GPU. After routing, all expert computations
     are performed on the CPU in float32 using a high-performance C++ kernel.
-    Assumes that expert weights have been quantized and stacked offline by the
-    `quantize_and_replace_moe_mlp` function.
+    Assumes that expert weights have been quantized and stacked offline.
     """
     def __init__(
         self,
@@ -35,8 +33,6 @@ class SparseMoeBlock(nn.Module):
         self.gate = Linear(self.hidden_size, self.num_experts, bias=False)
         
         # --- Quantized weights stored on CPU ---
-        # Stacking all experts' weights into single tensors on the CPU.
-        # This structure must match what the moe_q8_forward C++ kernel expects.
         self.gate_up_qs_stacked = nn.Parameter(torch.empty(
             self.num_experts, self.intermediate_size * 2, self.hidden_size, dtype=torch.int8, device="cpu"
         ), requires_grad=False)
@@ -55,86 +51,74 @@ class SparseMoeBlock(nn.Module):
         self,
         hidden_states: torch.Tensor,
         pinned_hidden: torch.Tensor,
-        pinned_routing: torch.Tensor,
-        pinned_experts: torch.Tensor,
+        pinned_logits: torch.Tensor,
     ):
         """
         Phase 1 (NPU, Graphable): Routing and dispatching data to CPU pinned memory.
         """
-        # === 1. NPU Part: Routing ===
-        pinned_hidden.copy_(hidden_states, non_blocking=True)
+        # === 1. NPU Part: Calculate router logits ===
         router_logits = self.gate(hidden_states)
-        routing_weights, selected_experts, _ = torch_npu.npu_moe_gating_top_k_softmax(router_logits, None, self.top_k)
-
-        if self.norm_top_k_prob:
-            routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
         
         # === 2. Transfer Data to CPU (Graphable Operation) ===
-        pinned_routing.copy_(routing_weights, non_blocking=True)
-        pinned_experts.copy_(selected_experts, non_blocking=True)
+        # Initiate non-blocking copies of hidden states and logits to pinned CPU memory.
+        pinned_hidden.copy_(hidden_states, non_blocking=True)
+        pinned_logits.copy_(router_logits, non_blocking=True)
 
-    def forward_cpu_expert(
-        self,
-        pinned_hidden: torch.Tensor,
-        pinned_routing: torch.Tensor,
-        pinned_experts: torch.Tensor,
-    ) -> torch.Tensor:
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """
-        Phase 2 (CPU, Eager): Run the expert computation on CPU.
-        Returns the result in the same pinned buffer (inplace).
+        Eager execution forward method demonstrating the two-phase computation.
         """
-        return nanovllm_ext.moe_q8_forward(
+        orig_device = hidden_states.device
+        num_tokens, H = hidden_states.shape
+
+        # Get pinned memory buffers for NPU -> CPU communication.
+        ctx = get_context()
+        pinned_hidden = ctx.get_pinned_buffer("moe_hidden", (num_tokens, H), hidden_states.dtype)
+        pinned_logits = ctx.get_pinned_buffer("moe_logits", (num_tokens, self.num_experts), hidden_states.dtype)
+        
+        # --- Phase 1: NPU Computation ---
+        self.forward_pre_expert(hidden_states, pinned_hidden, pinned_logits)
+        
+        # --- Synchronization Point ---
+        torch.npu.synchronize()
+
+        # --- Phase 2: CPU Computation ---
+
+        # === 1. CPU Gating: Call C++ kernel which returns new CPU tensors ===
+        routing_weights, selected_experts = nanovllm_ext.gating_top_k_softmax(
+            pinned_logits,
+            self.top_k,
+            self.norm_top_k_prob
+        )
+        
+        # === 2. CPU Expert Computation ===
+        # The result is written in-place into pinned_hidden, which is then returned.
+        nanovllm_ext.moe_q8_forward(
             pinned_hidden,
-            pinned_routing,
-            pinned_experts,
+            routing_weights,
+            selected_experts,
             self.gate_up_qs_stacked,
             self.gate_up_d_stacked,
             self.down_proj_qs_stacked,
             self.down_proj_d_stacked
         )
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """
-        Original forward method for eager execution.
-        """
-        orig_device = hidden_states.device
-        B, H = hidden_states.shape
-
-        # Get buffers for this specific call
-        ctx = get_context()
-        pinned_hidden = ctx.get_pinned_buffer("moe_hidden", (B, H), hidden_states.dtype)
-        pinned_routing = ctx.get_pinned_buffer("moe_routing", (B, self.top_k), hidden_states.dtype)
-        pinned_experts = ctx.get_pinned_buffer("moe_experts", (B, self.top_k), torch.int32)
-        
-        # Phase 1
-        self.forward_pre_expert(hidden_states, pinned_hidden, pinned_routing, pinned_experts)
-        
-        # Must synchronize here in eager mode to ensure data is on CPU
-        torch.npu.synchronize()
-
-        # Phase 2
-        pinned_hidden_result = self.forward_cpu_expert(pinned_hidden, pinned_routing, pinned_experts)
-        
-        return pinned_hidden_result.to(orig_device, non_blocking=True)
+        # Asynchronously copy the final result back to the NPU.
+        return pinned_hidden.to(orig_device, non_blocking=True)
 
     def expert_weight_loader(self, loaded_weight: torch.Tensor, expert_idx: int, proj_name: str):
         """
         Receives a single expert's weight, quantizes it, and places it into the correct
         slice of the stacked parameter tensors.
         """
-        # Ensure weight is on CPU and contiguous for the C++ extension
         loaded_weight = loaded_weight.contiguous().to(device="cpu", dtype=torch.float32)
 
-        # Quantize the weight
         qs, d = nanovllm_ext.quantize_repack_weight(loaded_weight)
 
-        # Place the quantized tensors into the correct slice of the stacked parameters
         if proj_name == "gate_proj":
-            # This is the first half of the merged gate_up tensor
             self.gate_up_qs_stacked.data[expert_idx, :self.intermediate_size, :] = qs
             self.gate_up_d_stacked.data[expert_idx, :self.intermediate_size, :] = d
         elif proj_name == "up_proj":
-            # This is the second half of the merged gate_up tensor
             self.gate_up_qs_stacked.data[expert_idx, self.intermediate_size:, :] = qs
             self.gate_up_d_stacked.data[expert_idx, self.intermediate_size:, :] = d
         elif proj_name == "down_proj":
