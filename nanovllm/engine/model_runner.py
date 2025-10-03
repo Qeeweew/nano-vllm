@@ -2,6 +2,8 @@ import pickle
 import torch
 from multiprocessing.synchronize import Event
 
+from tqdm.auto import tqdm
+
 from nanovllm.config import Config
 from nanovllm.engine.sequence import Sequence
 from nanovllm.models.qwen3 import Qwen3ForCausalLM
@@ -251,39 +253,39 @@ class ModelRunner:
         reset_context()
         return token_ids
 
-    # @torch.inference_mode()
-    # def capture_cudagraph(self):
-    #     config = self.config
-    #     hf_config = config.hf_config
-    #     max_bs = min(self.config.max_num_seqs, 512)
-    #     max_num_blocks = (config.max_model_len + self.block_size - 1) // self.block_size
-    #     input_ids = torch.zeros(max_bs, dtype=torch.int64)
-    #     positions = torch.zeros(max_bs, dtype=torch.int64)
-    #     slot_mapping = torch.zeros(max_bs, dtype=torch.int32)
-    #     context_lens = torch.zeros(max_bs, dtype=torch.int32)
-    #     block_tables = torch.zeros(max_bs, max_num_blocks, dtype=torch.int32)
-    #     outputs = torch.zeros(max_bs, hf_config.hidden_size)
-    #     self.graph_bs = [1, 2, 4, 8] + list(range(16, max_bs + 1, 16))
-    #     self.graphs = {}
-    #     self.graph_pool = None
+    @torch.inference_mode()
+    def capture_cudagraph(self):
+        config = self.config
+        hf_config = config.hf_config
+        max_bs = min(self.config.max_num_seqs, 512)
+        max_num_blocks = (config.max_model_len + self.block_size - 1) // self.block_size
+        input_ids = torch.zeros(max_bs, dtype=torch.int64)
+        positions = torch.zeros(max_bs, dtype=torch.int64)
+        slot_mapping = torch.zeros(max_bs, dtype=torch.int32)
+        context_lens = torch.zeros(max_bs, dtype=torch.int32)
+        block_tables = torch.zeros(max_bs, max_num_blocks, dtype=torch.int32)
+        outputs = torch.zeros(max_bs, hf_config.hidden_size)
+        self.graph_bs = [1, 2, 4, 8] + list(range(16, max_bs + 1, 16))
+        self.graphs = {}
+        self.graph_pool = None
 
-    #     for bs in reversed(self.graph_bs):
-    #         graph = torch.cuda.CUDAGraph()
-    #         set_context(False, slot_mapping=slot_mapping[:bs], context_lens=context_lens[:bs], block_tables=block_tables[:bs])
-    #         outputs[:bs] = self.model(input_ids[:bs], positions[:bs])    # warmup
-    #         with torch.cuda.graph(graph, self.graph_pool):
-    #             outputs[:bs] = self.model(input_ids[:bs], positions[:bs])    # capture
-    #         if self.graph_pool is None:
-    #             self.graph_pool = graph.pool()
-    #         self.graphs[bs] = graph
-    #         torch.cuda.synchronize()
-    #         reset_context()
+        for bs in tqdm(self.graph_bs, desc=f"[Rank {self.rank}] Capturing CUDA graphs"):
+            graph = torch.cuda.CUDAGraph()
+            set_context(False, slot_mapping=slot_mapping[:bs], context_lens=context_lens[:bs], block_tables=block_tables[:bs])
+            outputs[:bs] = self.model(input_ids[:bs], positions[:bs])    # warmup
+            with torch.cuda.graph(graph, self.graph_pool):
+                outputs[:bs] = self.model(input_ids[:bs], positions[:bs])    # capture
+            if self.graph_pool is None:
+                self.graph_pool = graph.pool()
+            self.graphs[bs] = graph
+            torch.cuda.synchronize()
+            reset_context()
 
-    #     self.graph_vars = dict(
-    #         input_ids=input_ids,
-    #         positions=positions,
-    #         slot_mapping=slot_mapping,
-    #         context_lens=context_lens,
-    #         block_tables=block_tables,
-    #         outputs=outputs,
-    #     )
+        self.graph_vars = dict(
+            input_ids=input_ids,
+            positions=positions,
+            slot_mapping=slot_mapping,
+            context_lens=context_lens,
+            block_tables=block_tables,
+            outputs=outputs,
+        )

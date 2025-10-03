@@ -8,7 +8,9 @@
 #include <cassert>
 #include <algorithm>
 #include <ATen/Parallel.h>
-#include <ATen/cpu/vec/vec.h>
+#include "utils.h"
+#include "vec_simd.h"
+#include <omp.h>
 
 #if defined(__ARM_NEON)
 #include <arm_neon.h>
@@ -363,57 +365,43 @@ void gemm_q8_0_microkernel(int kc_size, int mr, const int8_t* A_qs_packed, const
     }
 }
 
-template <typename T>
-static void quantize_pack_A_parallel_q8_0(
+template <ExecutionPolicy Policy, typename T>
+static void quantize_pack_A_q8_0(
     int M, int K, const T* A, int lda,
     int8_t* A_qs_packed, float* A_d_packed)
 {
     const int K_BLOCKS = K / QK8_0;
     const int num_a_packs = (M + MR - 1) / MR;
     
-    at::parallel_for(0, num_a_packs, 0, [&](int64_t start, int64_t end) {
-        float a_float_buf[MR * QK8_0];
+    dispatch_for<Policy>(0, num_a_packs, [&](int64_t i_pack) {
         int8_t a_qs_buf[MR * QK8_0];
-
-        for (int64_t i_pack = start; i_pack < end; ++i_pack) {
-            int i = i_pack * MR;
-            for (int j = 0; j < K_BLOCKS; ++j) {
-                int M_rem = std::min(MR, M - i);
-
-                // Convert input type to float before quantization
-                for (int row = 0; row < M_rem; ++row) {
-                    const T* src_row = A + (i + row) * lda + j * QK8_0;
-                    float* dst_row = a_float_buf + row * QK8_0;
+        int i = i_pack * MR;
+        for (int j = 0; j < K_BLOCKS; ++j) {
+            int M_rem = std::min(MR, M - i);
+            float* current_A_d_ptr = A_d_packed + i * K_BLOCKS + j * MR;
+            for (int row = 0; row < M_rem; ++row) {
+                if constexpr(std::is_same_v<T, float>) {
+                    quantize_block_q8_0(A + (i + row) * lda + j * QK8_0, &current_A_d_ptr[row], &a_qs_buf[row * QK8_0]);
+                } else {
+                    float a_float_buf[QK8_0];
                     for (int k = 0; k < QK8_0; ++k) {
-                        dst_row[k] = static_cast<float>(src_row[k]);
+                        a_float_buf[k] = static_cast<float>(A[(i + row) * lda + j * QK8_0 + k]);
                     }
+                    quantize_block_q8_0(a_float_buf, &current_A_d_ptr[row], &a_qs_buf[row * QK8_0]);
                 }
-
-                float* current_A_d_ptr = A_d_packed + i * K_BLOCKS + j * MR;
-                for (int row = 0; row < M_rem; ++row) {
-                    quantize_block_q8_0(a_float_buf + row * QK8_0, &current_A_d_ptr[row], &a_qs_buf[row * QK8_0]);
-                }
-
-                int8_t* current_qs_ptr = A_qs_packed + i * K + j * QK8_0 * MR;
-                for (int k = 0; k < QK8_0; k += 4) {
-                    for (int row = 0; row < MR; ++row) {
-                         if (row < M_rem) {
-                            memcpy(current_qs_ptr, &a_qs_buf[row * QK8_0 + k], 4);
-                         } else {
-                            // Padding for simplicity in kernel
-                            memset(current_qs_ptr, 0, 4);
-                         }
-                        current_qs_ptr += 4;
-                    }
+            }
+            int8_t* current_qs_ptr = A_qs_packed + i * K + j * QK8_0 * MR;
+            for (int k = 0; k < QK8_0; k += 4) {
+                for (int row = 0; row < MR; ++row) {
+                    memcpy(current_qs_ptr, &a_qs_buf[row * QK8_0 + k], 4);
+                    current_qs_ptr += 4;
                 }
             }
         }
     });
 }
 
-// ==========================================================================================
-// NEW: Function to perform GEMM computation with pre-packed matrices
-// ==========================================================================================
+template <ExecutionPolicy Policy>
 static void gemm_q8_0_compute_packed(
     int M, int N, int K,
     const int8_t* A_qs_packed, const float* A_d_packed,
@@ -423,9 +411,25 @@ static void gemm_q8_0_compute_packed(
     const int K_BLOCKS = K / QK8_0;
     constexpr int MC = 32; constexpr int KC = 1024; constexpr int NC = 32;
     const int num_nc_blocks = (N + NC - 1) / NC;
-    
-    at::parallel_for(0, num_nc_blocks, 0, [&](int64_t start, int64_t end) {
-        for (int64_t jc_idx = start; jc_idx < end; ++jc_idx) {
+
+    if (M <= MR) {
+        dispatch_for<Policy>(0, num_nc_blocks, [&](int64_t jc_idx) {
+            int jc = jc_idx * NC;
+            const int nc = std::min(NC, N - jc);
+            for (int jr = 0; jr < nc; jr += NR) {
+                gemm_q8_0_microkernel(
+                    K, M,
+                    A_qs_packed,
+                    A_d_packed,
+                    B_qs_packed + (jc + jr) * K,
+                    B_d_packed_f16 + (jc + jr) * (K / QK8_0),
+                    C + (jc + jr),
+                    ldc,
+                    false);
+            }
+        });
+    } else {
+        dispatch_for<Policy>(0, num_nc_blocks, [&](int64_t jc_idx) {
             int jc = jc_idx * NC;
             const int nc = std::min(NC, N - jc);
             for (int kc = 0; kc < K; kc += KC) {
@@ -446,8 +450,8 @@ static void gemm_q8_0_compute_packed(
                     }
                 }
             }
-        }
-    });
+        });
+    }
 }
 
 void gemm_q8_0_aten_parallel_packed(int M, int N, int K, const float* A, int lda, const int8_t* B_qs_packed, const ggml_half* B_d_packed_f16, float* C) {
@@ -459,40 +463,13 @@ void gemm_q8_0_aten_parallel_packed(int M, int N, int K, const float* A, int lda
     float* A_d_packed = static_cast<float*>(std::aligned_alloc(64, M_CEIL * K_BLOCKS * sizeof(float)));
 
     // Phase 1: Quantize and Pack A
-    quantize_pack_A_parallel_q8_0<float>(M, K, A, lda, A_qs_packed, A_d_packed);
+    quantize_pack_A_q8_0<ExecutionPolicy::Parallel,float>(M, K, A, lda, A_qs_packed, A_d_packed);
 
     // Phase 2: GEMM Computation
-    gemm_q8_0_compute_packed(M, N, K, A_qs_packed, A_d_packed, B_qs_packed, B_d_packed_f16, C, N);
+    gemm_q8_0_compute_packed<ExecutionPolicy::Parallel>(M, N, K, A_qs_packed, A_d_packed, B_qs_packed, B_d_packed_f16, C, N);
 
     std::free(A_qs_packed);
     std::free(A_d_packed);
-}
-
-
-template <typename T>
-static void quantize_rows_parallel_q8_0(
-    int M, int K, const T* A, int lda,
-    int8_t* A_qs, float* A_d)
-{
-    const int K_BLOCKS = K / QK8_0;
-    at::parallel_for(0, M, 0, [&](int64_t start, int64_t end) {
-        std::vector<float> temp_row(K);
-        for(int64_t i = start; i < end; ++i) {
-            const T* src_row = A + i * lda;
-            // Convert input row to float for quantization
-            for(int j = 0; j < K; ++j) {
-                temp_row[j] = static_cast<float>(src_row[j]);
-            }
-            // Quantize each block in the row
-            for (int k_block = 0; k_block < K_BLOCKS; ++k_block) {
-                quantize_block_q8_0(
-                    temp_row.data() + k_block * QK8_0,
-                    A_d + i * K_BLOCKS + k_block,
-                    A_qs + i * K + k_block * QK8_0
-                );
-            }
-        }
-    });
 }
 
 // ==========================================================================================
@@ -618,88 +595,326 @@ static void preprocess_moe_routing(
     }
 }
 
-
-// A specialized SiLU activation function for MoE.
-// x = gate_proj(x), y = up_proj(x)
-// return silu(x) * y
-using Vec = at::vec::Vectorized<float>;
-
-static void silu_and_mul(float* C, int num_tokens, int intermediate_size) {
-    const int size_div_2 = intermediate_size / 2;
-    at::parallel_for(0, num_tokens, 0, [&](int64_t start, int64_t end) {
-        for (int64_t i = start; i < end; ++i) {
-            float* row = C + i * intermediate_size;
-            float* gate_part = row;
-            float* up_part = row + size_div_2;
-            
-            int j = 0;
-            // 1. Vectorized 主循环
-            // 每次处理 Vec::size() 个 float 元素
-            for (; j + Vec::size() <= size_div_2; j += Vec::size()) {
-                // 从内存加载数据到向量寄存器
-                Vec gate_vec = Vec::loadu(gate_part + j);
-                Vec up_vec = Vec::loadu(up_part + j);
-
-                const Vec one_vec(1.0f);
-                Vec activation_vec = gate_vec / (one_vec + gate_vec.neg().exp());
-                Vec result_vec = up_vec * activation_vec;
-
-                result_vec.store(row + j);
-            }
-
-            // 2. Scalar 收尾循环
-            // 处理剩余不足一个向量长度的元素
-            for (; j < size_div_2; ++j) {
-                float gate_val = gate_part[j];
-                // SiLU (Swish) 激活函数: x * sigmoid(x)
-                float activation = gate_val / (1.0f + expf(-gate_val));
-                row[j] = up_part[j] * activation;
-            }
-        }
-    });
-}
-
+template <ExecutionPolicy Policy>
 static void pack_A_q8_0_from_quantized_indirect(
     int M, int K,
-    const int8_t* x_qs_base,           // 原始量化数据（未 gather）
-    const float* x_d_base,             // 原始 scale 数据
-    const MoETokenInfo* token_map,     // 间接索引映射表
-    int token_offset,                  // 当前专家的起始 token 在 token_map 中的偏移
+    const int8_t* x_qs_base,
+    const float* x_d_base,
+    const MoETokenInfo* token_map,
+    int token_offset,
     int8_t* A_qs_packed,
     float* A_d_packed
 ) {
     const int K_BLOCKS = K / QK8_0;
     const int num_a_packs = (M + MR - 1) / MR;
 
-    at::parallel_for(0, num_a_packs, 0, [&](int64_t start, int64_t end) {
-        for (int64_t i_pack = start; i_pack < end; ++i_pack) {
-            int row_in_expert = i_pack * MR;  // 当前 pack 在专家局部行号
-            for (int j = 0; j < K_BLOCKS; ++j) {
-                int M_rem = std::min(MR, M - row_in_expert);
-                float* current_A_d_ptr = A_d_packed + row_in_expert * K_BLOCKS + j * MR;
-
-                // 逐行复制 d 值：从原始 x_d_base + token_map[token_offset + row].token_id
-                for (int local_row = 0; local_row < M_rem; ++local_row) {
-                    int global_token_id = token_map[token_offset + row_in_expert + local_row].token_id;
-                    current_A_d_ptr[local_row] = x_d_base[global_token_id * K_BLOCKS + j];
-                }
-
-                // Pack qs 值
-                int8_t* current_qs_ptr = A_qs_packed + row_in_expert * K + j * QK8_0 * MR;
-                for (int k = 0; k < QK8_0; k += 4) {
-                    for (int local_row = 0; local_row < MR; ++local_row) {
-                        if (local_row < M_rem) {
-                            int global_token_id = token_map[token_offset + row_in_expert + local_row].token_id;
-                            memcpy(current_qs_ptr,
-                                   x_qs_base + global_token_id * K + j * QK8_0 + k,
-                                   4);
-                        }
-                        current_qs_ptr += 4;
+    dispatch_for<Policy>(0, num_a_packs, [&](int64_t i_pack) {
+        int row_in_expert = i_pack * MR;
+        for (int j = 0; j < K_BLOCKS; ++j) {
+            int M_rem = std::min(MR, M - row_in_expert);
+            float* current_A_d_ptr = A_d_packed + row_in_expert * K_BLOCKS + j * MR;
+            for (int local_row = 0; local_row < M_rem; ++local_row) {
+                int global_token_id = token_map[token_offset + row_in_expert + local_row].token_id;
+                current_A_d_ptr[local_row] = x_d_base[global_token_id * K_BLOCKS + j];
+            }
+            int8_t* current_qs_ptr = A_qs_packed + row_in_expert * K + j * QK8_0 * MR;
+            for (int k = 0; k < QK8_0; k += 4) {
+                for (int local_row = 0; local_row < MR; ++local_row) {
+                    if (local_row < M_rem) {
+                        int global_token_id = token_map[token_offset + row_in_expert + local_row].token_id;
+                        memcpy(current_qs_ptr,
+                               x_qs_base + global_token_id * K + j * QK8_0 + k,
+                               4);
                     }
+                    current_qs_ptr += 4;
                 }
             }
         }
     });
+}
+
+// 放置在 moe_q8_forward_impl 函数之前
+
+// Helper to align memory addresses to 64 bytes
+static inline size_t align_to_64(size_t n) {
+    return (n + 63) & ~63;
+}
+
+// A thread-local workspace that manages its own memory.
+// It allocates or resizes its buffer only when necessary.
+struct ThreadWorkspace {
+    char* memory_pool = nullptr;
+    size_t current_size = 0;
+
+    // Pointers that will point into the memory_pool
+    int8_t* A_qs_packed1;
+    float* A_d_packed1;
+    float* expert_intermediate1;
+    int8_t* A_qs_packed2;
+    float* A_d_packed2;
+    float* temp_row_buffer; // Added for row-wise type conversion
+
+    ThreadWorkspace() = default;
+
+    // Ensures the workspace is large enough for the current task.
+    // Re-allocates only if the required size is larger than the current allocation.
+    void ensure_size(int m_ceil, int k_hidden, int k_inter, int k_inter_x2) {
+        const int k_hidden_k_blocks = k_hidden / QK8_0;
+        const int k_inter_k_blocks = k_inter / QK8_0;
+
+        // Calculate sizes and offsets for all temporary buffers
+        const size_t size_A_qs1 = m_ceil * k_hidden * sizeof(int8_t);
+        const size_t size_A_d1 = m_ceil * k_hidden_k_blocks * sizeof(float);
+        const size_t size_intermediate1 = m_ceil * k_inter_x2 * sizeof(float);
+        const size_t size_A_qs2 = m_ceil * k_inter * sizeof(int8_t);
+        const size_t size_A_d2 = m_ceil * k_inter_k_blocks * sizeof(float);
+        const size_t size_temp_row = k_hidden * sizeof(float); // Size for the new buffer
+
+        const size_t offset_A_qs1 = 0;
+        const size_t offset_A_d1 = align_to_64(offset_A_qs1 + size_A_qs1);
+        const size_t offset_intermediate1 = align_to_64(offset_A_d1 + size_A_d1);
+        const size_t offset_A_qs2 = align_to_64(offset_intermediate1 + size_intermediate1);
+        const size_t offset_A_d2 = align_to_64(offset_A_qs2 + size_A_qs2);
+        const size_t offset_temp_row = align_to_64(offset_A_d2 + size_A_d2); // Offset for the new buffer
+        
+        const size_t required_size = align_to_64(offset_temp_row + size_temp_row); // Updated required size
+
+        if (required_size > current_size) {
+            if (memory_pool) {
+                std::free(memory_pool);
+            }
+            memory_pool = static_cast<char*>(std::aligned_alloc(64, required_size));
+            current_size = required_size;
+        }
+
+        // Set up the pointers into the (potentially newly allocated) memory pool.
+        // This must be done on every call in case dimensions change, even if reallocation
+        // doesn't happen.
+        A_qs_packed1 = reinterpret_cast<int8_t*>(memory_pool + offset_A_qs1);
+        A_d_packed1 = reinterpret_cast<float*>(memory_pool + offset_A_d1);
+        expert_intermediate1 = reinterpret_cast<float*>(memory_pool + offset_intermediate1);
+        A_qs_packed2 = reinterpret_cast<int8_t*>(memory_pool + offset_A_qs2);
+        A_d_packed2 = reinterpret_cast<float*>(memory_pool + offset_A_d2);
+        temp_row_buffer = reinterpret_cast<float*>(memory_pool + offset_temp_row); // Set the new pointer
+    }
+
+    // Destructor automatically cleans up memory when the thread terminates.
+    ~ThreadWorkspace() {
+        if (memory_pool) {
+            std::free(memory_pool);
+        }
+    }
+};
+
+// Declare a single thread_local instance. Each thread will get its own copy.
+static thread_local ThreadWorkspace ws;
+
+// =================================================================================================
+// STRATEGY 1: N-AXIS PARALLELISM (for few active experts)
+// =================================================================================================
+static void moe_q8_forward_n_axis_parallel(
+    int num_experts, const std::vector<int>& expert_counts, const std::vector<int>& expert_starts, const std::vector<int>& active_expert_ids,
+    const MoETokenInfo* token_map, int total_expert_tokens,
+    int hidden_dim, int intermediate_size, int intermediate_size_x2,
+    const int8_t* x_qs, const float* x_d,
+    torch::Tensor& gate_up_qs_stacked, torch::Tensor& gate_up_d_stacked,
+    torch::Tensor& down_proj_qs_stacked, torch::Tensor& down_proj_d_stacked,
+    float* expert_intermediate2 // Output buffer
+) {
+    int num_threads = omp_get_max_threads();
+    const int hidden_dim_k_blocks = hidden_dim / QK8_0;
+    const int intermediate_dim_k_blocks = intermediate_size / QK8_0;
+    int active_experts_count = static_cast<int>(active_expert_ids.size());
+
+    // --- Pre-computation: Map threads to experts and their tasks ---
+    struct ThreadTask {
+        int expert_id, active_expert_id, num_tokens, token_offset;
+        int thread_idx_in_expert, total_threads_for_expert;
+    };
+    std::vector<ThreadTask> thread_map(num_threads);
+    int threads_per_expert = num_threads / active_experts_count;
+    int remainder_threads = num_threads % active_experts_count;
+    int current_thread = 0;
+    for (int i = 0; i < active_experts_count; ++i) {
+        int count = threads_per_expert + (i < remainder_threads ? 1 : 0);
+        int expert_id = active_expert_ids[i];
+        for (int j = 0; j < count; ++j) {
+            if (current_thread < num_threads) {
+                thread_map[current_thread++] = {
+                    expert_id, i, expert_counts[expert_id], expert_starts[expert_id], j, count
+                };
+            }
+        }
+    }
+
+    // --- Allocate ALL temporary buffers for this strategy ---
+    std::vector<int> m_ceil_offset(active_experts_count);
+    int m_ceil_cumulative = 0;
+
+    for (int i = 0; i < active_experts_count; ++i) {
+        int exp_id = active_expert_ids[i];
+        const int M = expert_counts[exp_id];
+        const int M_CEIL = (M + MR - 1) / MR * MR;
+        m_ceil_offset[i] = m_ceil_cumulative;
+        m_ceil_cumulative += M_CEIL;
+    }
+
+    // Buffer for GEMM 1 packed A
+    size_t total_packed_A1_qs_size = m_ceil_cumulative * hidden_dim;
+    size_t total_packed_A1_d_size = m_ceil_cumulative * hidden_dim_k_blocks;
+    size_t total_packed_A2_qs_size = m_ceil_cumulative * intermediate_size;
+    size_t total_packed_A2_d_size = m_ceil_cumulative * intermediate_dim_k_blocks;
+
+    int8_t* packed_A1_qs_all = static_cast<int8_t*>(std::aligned_alloc(64, total_packed_A1_qs_size * sizeof(int8_t)));
+    float* packed_A1_d_all = static_cast<float*>(std::aligned_alloc(64, total_packed_A1_d_size * sizeof(float)));
+    float* expert_intermediate1 = static_cast<float*>(std::aligned_alloc(64, total_expert_tokens * intermediate_size_x2 * sizeof(float)));
+    int8_t* packed_A2_qs_all = static_cast<int8_t*>(std::aligned_alloc(64, total_packed_A2_qs_size * sizeof(int8_t)));
+    float* packed_A2_d_all = static_cast<float*>(std::aligned_alloc(64, total_packed_A2_d_size * sizeof(float)));
+
+    #pragma omp parallel num_threads(num_threads)
+    {
+        const int thread_id = omp_get_thread_num();
+        const auto& task = thread_map[thread_id];
+        const int exp_id = task.expert_id;
+        const int active_exp_id = task.active_expert_id;
+        const int M = task.num_tokens;
+        const int T_exp = task.total_threads_for_expert;
+        const int t_idx = task.thread_idx_in_expert;
+
+        int8_t* my_A1_qs_ptr = packed_A1_qs_all + m_ceil_offset[active_exp_id] * hidden_dim;
+        float* my_A1_d_ptr = packed_A1_d_all + m_ceil_offset[active_exp_id] * hidden_dim_k_blocks;
+        int8_t* my_A2_qs_ptr = packed_A2_qs_all + m_ceil_offset[active_exp_id] * intermediate_size;
+        float* my_A2_d_ptr = packed_A2_d_all + m_ceil_offset[active_exp_id] * intermediate_dim_k_blocks;
+        int8_t* gate_up_qs_ptr = gate_up_qs_stacked.data_ptr<int8_t>() + exp_id * intermediate_size_x2 * hidden_dim;
+        at::Half* gate_up_d_ptr = gate_up_d_stacked.data_ptr<at::Half>() + exp_id * intermediate_size_x2 * hidden_dim_k_blocks;
+        int8_t* down_proj_qs_ptr = down_proj_qs_stacked.data_ptr<int8_t>() + exp_id * hidden_dim * intermediate_size;
+        at::Half* down_proj_d_ptr = down_proj_d_stacked.data_ptr<at::Half>() + exp_id * hidden_dim * intermediate_dim_k_blocks;
+
+        if (t_idx == 0) {
+            pack_A_q8_0_from_quantized_indirect<ExecutionPolicy::Sequential>(
+                M, hidden_dim, x_qs, x_d, token_map, task.token_offset,
+                my_A1_qs_ptr, my_A1_d_ptr
+            );
+        }
+
+        #pragma omp barrier
+
+        // --- FFN Up-Projection (GEMM 1), split by N ---
+        constexpr int NC = 32;
+        int n_chunk1 = (intermediate_size_x2 + T_exp - 1) / T_exp;
+        n_chunk1 = ((n_chunk1 + NC - 1) / NC) * NC;
+        int n_start1 = t_idx * n_chunk1;
+        int n_size1 = std::min(n_chunk1, intermediate_size_x2 - n_start1);
+        if (n_size1 > 0) {
+            gemm_q8_0_compute_packed<ExecutionPolicy::Sequential>(
+                M, n_size1, hidden_dim, my_A1_qs_ptr, my_A1_d_ptr,
+                gate_up_qs_ptr + n_start1 * hidden_dim,
+                reinterpret_cast<const ggml_half*>(gate_up_d_ptr) + n_start1 * hidden_dim_k_blocks,
+                expert_intermediate1 + task.token_offset * intermediate_size_x2 + n_start1, intermediate_size_x2
+            );
+        }
+
+        #pragma omp barrier
+
+        // --- SILU Activation & Quantize for GEMM 2 ---
+        // Only the first thread for each expert performs these steps for the whole expert's data.
+        if (t_idx == 0) {
+            // 1. SILU activation
+            silu_and_mul<ExecutionPolicy::Sequential>(
+                expert_intermediate1 + task.token_offset * intermediate_size_x2,
+                M, intermediate_size_x2
+            );
+            // 2. Quantize and pack the result for the next GEMM
+            quantize_pack_A_q8_0<ExecutionPolicy::Sequential, float>(
+                M, intermediate_size, expert_intermediate1 + task.token_offset * intermediate_size_x2, intermediate_size_x2,
+                my_A2_qs_ptr, my_A2_d_ptr
+            );
+        }
+
+        #pragma omp barrier
+
+        // --- FFN Down-Projection (GEMM 2), split by N ---
+
+        int n_chunk2 = (hidden_dim + T_exp - 1) / T_exp;
+        n_chunk2 = ((n_chunk2 + NC - 1) / NC) * NC;
+        int n_start2 = t_idx * n_chunk2;
+        int n_size2 = std::min(n_chunk2, hidden_dim - n_start2);
+        if (n_size2 > 0) {
+            gemm_q8_0_compute_packed<ExecutionPolicy::Sequential>(
+                M, n_size2, intermediate_size, my_A2_qs_ptr, my_A2_d_ptr,
+                down_proj_qs_ptr + n_start2 * intermediate_size,
+                reinterpret_cast<const ggml_half*>(down_proj_d_ptr) + n_start2 * intermediate_dim_k_blocks,
+                expert_intermediate2 + task.token_offset * hidden_dim + n_start2, hidden_dim
+            );
+        }
+    } // end parallel region
+
+    // --- Cleanup ---
+    std::free(packed_A1_qs_all); std::free(packed_A1_d_all);
+    std::free(expert_intermediate1);
+    std::free(packed_A2_qs_all); std::free(packed_A2_d_all);
+}
+
+// =================================================================================================
+// STRATEGY 2: TASK PARALLELISM (for many active experts)
+// =================================================================================================
+static void moe_q8_forward_task_parallel(
+    int num_experts, const std::vector<int>& expert_counts, const std::vector<int>& expert_starts,
+    const MoETokenInfo* token_map, int total_expert_tokens,
+    int hidden_dim, int intermediate_size, int intermediate_size_x2,
+    const int8_t* x_qs, const float* x_d,
+    torch::Tensor& gate_up_qs_stacked, torch::Tensor& gate_up_d_stacked,
+    torch::Tensor& down_proj_qs_stacked, torch::Tensor& down_proj_d_stacked,
+    float* expert_intermediate2 // Output buffer
+) {
+    const int hidden_dim_k_blocks = hidden_dim / QK8_0;
+    const int intermediate_dim_k_blocks = intermediate_size / QK8_0;
+
+    constexpr int M_BLOCK = 32;
+    struct MoeTask { int expert_id, num_tokens, global_token_start_pos; };
+    std::vector<MoeTask> tasks;
+    tasks.reserve(total_expert_tokens / M_BLOCK + num_experts);
+    for (int exp_id = 0; exp_id < num_experts; ++exp_id) {
+        const int count = expert_counts[exp_id];
+        if (count == 0) continue;
+        const int start_pos = expert_starts[exp_id];
+        for (int offset = 0; offset < count; offset += M_BLOCK) {
+            tasks.push_back({exp_id, std::min(M_BLOCK, count - offset), start_pos + offset});
+        }
+    }
+
+    #pragma omp parallel for schedule(dynamic)
+    for (int64_t i = 0; i < tasks.size(); ++i) {
+        const auto& task = tasks[i];
+        const int exp_id = task.expert_id, count = task.num_tokens, global_start_pos = task.global_token_start_pos;
+
+        int8_t* gate_up_qs_ptr = gate_up_qs_stacked.data_ptr<int8_t>() + exp_id * intermediate_size_x2 * hidden_dim;
+        at::Half* gate_up_d_ptr = gate_up_d_stacked.data_ptr<at::Half>() + exp_id * intermediate_size_x2 * hidden_dim_k_blocks;
+        int8_t* down_proj_qs_ptr = down_proj_qs_stacked.data_ptr<int8_t>() + exp_id * hidden_dim * intermediate_size;
+        at::Half* down_proj_d_ptr = down_proj_d_stacked.data_ptr<at::Half>() + exp_id * hidden_dim * intermediate_dim_k_blocks;
+
+        pack_A_q8_0_from_quantized_indirect<ExecutionPolicy::Sequential>(
+            count, hidden_dim, x_qs, x_d, token_map, global_start_pos,
+            ws.A_qs_packed1, ws.A_d_packed1
+        );
+        gemm_q8_0_compute_packed<ExecutionPolicy::Sequential>(
+            count, intermediate_size_x2, hidden_dim, ws.A_qs_packed1, ws.A_d_packed1,
+            gate_up_qs_ptr, reinterpret_cast<const ggml_half*>(gate_up_d_ptr),
+            ws.expert_intermediate1, intermediate_size_x2
+        );
+
+        silu_and_mul<ExecutionPolicy::Sequential>(ws.expert_intermediate1, count, intermediate_size_x2);
+
+        quantize_pack_A_q8_0<ExecutionPolicy::Sequential, float>(
+            count, intermediate_size, ws.expert_intermediate1, intermediate_size_x2,
+            ws.A_qs_packed2, ws.A_d_packed2
+        );
+        gemm_q8_0_compute_packed<ExecutionPolicy::Sequential>(
+            count, hidden_dim, intermediate_size, ws.A_qs_packed2, ws.A_d_packed2,
+            down_proj_qs_ptr, reinterpret_cast<const ggml_half*>(down_proj_d_ptr),
+            expert_intermediate2 + global_start_pos * hidden_dim, hidden_dim
+        );
+    }
 }
 
 template <typename T>
@@ -712,6 +927,9 @@ torch::Tensor moe_q8_forward_impl(
     torch::Tensor down_proj_qs_stacked,
     torch::Tensor down_proj_d_stacked
 ) {
+    // =======================================================================
+    // 1. PREPROCESSING & GATHER/SCATTER MAP CREATION
+    // =======================================================================
     const auto num_tokens = x.size(0);
     const auto hidden_dim = x.size(1);
     const auto num_experts = gate_up_qs_stacked.size(0);
@@ -719,14 +937,11 @@ torch::Tensor moe_q8_forward_impl(
     const auto intermediate_size = down_proj_qs_stacked.size(2);
     const auto top_k = selected_experts.size(1);
     const auto hidden_dim_k_blocks = hidden_dim / QK8_0;
-    const auto intermediate_dim_k_blocks = intermediate_size / QK8_0;
 
     std::vector<int> expert_counts(num_experts, 0);
     std::vector<int> expert_starts(num_experts + 1, 0);
     std::vector<MoETokenInfo> token_map;
     std::vector<int32_t> scatter_map;
-   
-    torch::cuda::synchronize();
 
     preprocess_moe_routing(
         num_experts, top_k, num_tokens, selected_experts.data_ptr<int32_t>(),
@@ -734,104 +949,98 @@ torch::Tensor moe_q8_forward_impl(
     );
 
     const int total_expert_tokens = expert_starts[num_experts];
-    
-    std::vector<int8_t> x_qs(num_tokens * hidden_dim);
-    std::vector<float> x_d(num_tokens * hidden_dim_k_blocks);
-    quantize_rows_parallel_q8_0<T>(
-        num_tokens, hidden_dim, x.data_ptr<T>(), hidden_dim,
-        x_qs.data(), x_d.data()
-    );
+    if (total_expert_tokens == 0) {
+        x.zero_();
+        return x;
+    }
 
-    const int max_expert_tokens = total_expert_tokens > 0 ? *std::max_element(expert_counts.begin(), expert_counts.end()) : 0;
-    const int M_CEIL_GEMM = (max_expert_tokens + MR - 1) / MR * MR;
-
-    int8_t* A_qs_packed1 = static_cast<int8_t*>(std::aligned_alloc(64, M_CEIL_GEMM * hidden_dim * sizeof(int8_t)));
-    float* A_d_packed1 = static_cast<float*>(std::aligned_alloc(64, M_CEIL_GEMM * hidden_dim_k_blocks * sizeof(float)));
-    int8_t* A_qs_packed2 = static_cast<int8_t*>(std::aligned_alloc(64, M_CEIL_GEMM * intermediate_size * sizeof(int8_t)));
-    float* A_d_packed2 = static_cast<float*>(std::aligned_alloc(64, M_CEIL_GEMM * intermediate_dim_k_blocks * sizeof(float)));
-
-    float* expert_intermediate1 = static_cast<float*>(std::aligned_alloc(64, max_expert_tokens * intermediate_size_x2 * sizeof(float)));
+    // =======================================================================
+    // 2. ALLOCATE BUFFERS
+    // =======================================================================
+    int8_t* x_qs = static_cast<int8_t*>(std::aligned_alloc(64, num_tokens * hidden_dim * sizeof(int8_t)));
+    float* x_d = static_cast<float*>(std::aligned_alloc(64, num_tokens * hidden_dim_k_blocks * sizeof(float)));
     float* expert_intermediate2 = static_cast<float*>(std::aligned_alloc(64, total_expert_tokens * hidden_dim * sizeof(float)));
+    constexpr int M_BLOCK = 32;
+    static_assert(M_BLOCK % MR == 0, "M_BLOCK must be a multiple of MR");
 
-    for (int64_t exp_id = 0; exp_id < num_experts; ++exp_id) {
-        int count = expert_counts[exp_id];
-        if (count == 0) continue;
-        int start_pos = expert_starts[exp_id];
+    // =======================================================================
+    // 3. QUANTIZE ACTIVATIONS (COMMON STEP)
+    // =======================================================================
+    #pragma omp parallel
+    {
+        // For task_parallel path, ws needs to be sized for M_BLOCK
+        ws.ensure_size(M_BLOCK, hidden_dim, intermediate_size, intermediate_size_x2);
+        #pragma omp for
+        for (int64_t i = 0; i < num_tokens; ++i) {
+            const T* src_row = x.data_ptr<T>() + i * hidden_dim;
+            for (int j = 0; j < hidden_dim; ++j) {
+                ws.temp_row_buffer[j] = static_cast<float>(src_row[j]);
+            }
+            for (int k_block = 0; k_block < hidden_dim_k_blocks; ++k_block) {
+                quantize_block_q8_0(
+                    ws.temp_row_buffer + k_block * QK8_0,
+                    x_d + i * hidden_dim_k_blocks + k_block,
+                    x_qs + i * hidden_dim + k_block * QK8_0
+                );
+            }
+        }
+    }
 
-        pack_A_q8_0_from_quantized_indirect(
-            count, hidden_dim,
-            x_qs.data(),           // 原始 qs
-            x_d.data(),            // 原始 d
-            token_map.data(),      // token 映射表
-            start_pos,             // 当前专家在 token_map 中的起始偏移
-            A_qs_packed1,
-            A_d_packed1
+    // =======================================================================
+    // 4. EXPERT COMPUTATION (DISPATCH TO PARALLELISM STRATEGY)
+    // =======================================================================
+
+    const int num_threads = omp_get_max_threads();
+
+    std::vector<int> active_expert_ids;
+    for(int i = 0; i < num_experts; ++i) {
+        if (expert_counts[i] > 0) active_expert_ids.push_back(i);
+    }
+    const int active_experts_count = active_expert_ids.size();
+    if (active_experts_count > 0 && active_experts_count * 2 <= num_threads) {
+        moe_q8_forward_n_axis_parallel(
+            num_experts, expert_counts, expert_starts, active_expert_ids,
+            token_map.data(), total_expert_tokens, hidden_dim, intermediate_size, intermediate_size_x2,
+            x_qs, x_d, gate_up_qs_stacked, gate_up_d_stacked,
+            down_proj_qs_stacked, down_proj_d_stacked, expert_intermediate2
         );
-
-        // --- GEMM 1: gate_up_proj ---
-        gemm_q8_0_compute_packed(
-            count, intermediate_size_x2, hidden_dim,
-            A_qs_packed1, A_d_packed1,
-            gate_up_qs_stacked[exp_id].data_ptr<int8_t>(),
-            reinterpret_cast<const ggml_half*>(gate_up_d_stacked[exp_id].data_ptr<at::Half>()),
-            expert_intermediate1,
-            intermediate_size_x2
-        );
-
-        // Activation
-        silu_and_mul(expert_intermediate1, count, intermediate_size_x2);
-
-        // --- GEMM 2: down_proj ---
-        quantize_pack_A_parallel_q8_0<float>(
-            count, intermediate_size,
-            expert_intermediate1, intermediate_size_x2,
-            A_qs_packed2, A_d_packed2
-        );
-        gemm_q8_0_compute_packed(
-            count, hidden_dim, intermediate_size,
-            A_qs_packed2, A_d_packed2,
-            down_proj_qs_stacked[exp_id].data_ptr<int8_t>(),
-            reinterpret_cast<const ggml_half*>(down_proj_d_stacked[exp_id].data_ptr<at::Half>()),
-            expert_intermediate2 + start_pos * hidden_dim,
-            hidden_dim
+    } else if (active_experts_count > 0) {
+        moe_q8_forward_task_parallel(
+            num_experts, expert_counts, expert_starts,
+            token_map.data(), total_expert_tokens, hidden_dim, intermediate_size, intermediate_size_x2,
+            x_qs, x_d, gate_up_qs_stacked, gate_up_d_stacked,
+            down_proj_qs_stacked, down_proj_d_stacked, expert_intermediate2
         );
     }
 
+    // =======================================================================
+    // 5. SCATTER AND WEIGHTING (COMMON STEP)
+    // =======================================================================
     T* final_output_ptr = x.data_ptr<T>();
-    const T* routing_weights_ptr = routing_weights.data_ptr<T>();
+    const float* routing_weights_ptr = routing_weights.data_ptr<float>();
 
-    // Token-centric Parallel Aggregation (Scatter)
-    at::parallel_for(0, num_tokens, 0, [&](int64_t start, int64_t end) {
+    #pragma omp parallel for
+    for (int64_t t = 0; t < num_tokens; ++t) {
         std::vector<float> acc_buffer(hidden_dim, 0.0f);
-        for (int64_t t = start; t < end; ++t) {
-            std::fill(acc_buffer.begin(), acc_buffer.end(), 0.0f);
-            for (int k = 0; k < top_k; ++k) {
-                const int scatter_idx = t * top_k + k;
-                const int src_row_idx = scatter_map[scatter_idx];
-                if (src_row_idx == -1) continue;
-
-                const float weight = static_cast<float>(routing_weights_ptr[scatter_idx]);
-                const float* src_row = expert_intermediate2 + src_row_idx * hidden_dim;
-
-                for (int j = 0; j < hidden_dim; ++j) {
-                    acc_buffer[j] += weight * src_row[j];
-                }
-            }
-            T* dst_row = final_output_ptr + t * hidden_dim;
-            const float* src_row_acc = acc_buffer.data();
+        for (int k = 0; k < top_k; ++k) {
+            const int scatter_idx = t * top_k + k;
+            const int src_row_idx = scatter_map[scatter_idx];
+            if (src_row_idx == -1) continue;
+            const float weight = routing_weights_ptr[scatter_idx];
+            const float* src_row = expert_intermediate2 + src_row_idx * hidden_dim;
             for (int j = 0; j < hidden_dim; ++j) {
-                dst_row[j] = static_cast<T>(src_row_acc[j]);
+                acc_buffer[j] += weight * src_row[j];
             }
         }
-    });
-
-    std::free(A_qs_packed1);
-    std::free(A_d_packed1);
-    std::free(A_qs_packed2);
-    std::free(A_d_packed2);
-    std::free(expert_intermediate1);
+        T* dst_row = final_output_ptr + t * hidden_dim;
+        for (int j = 0; j < hidden_dim; ++j) {
+            dst_row[j] = static_cast<T>(acc_buffer[j]);
+        }
+    }
+        // --- Cleanup ---
+    std::free(x_qs);
+    std::free(x_d);
     std::free(expert_intermediate2);
-    
     return x;
 }
 
@@ -846,29 +1055,150 @@ torch::Tensor moe_q8_forward(
     torch::Tensor down_proj_d_stacked
 ) {
     // 检查输入和权重是否具有相同的dtype
-    TORCH_CHECK(x.scalar_type() == routing_weights.scalar_type(), 
-                "x and routing_weights must have the same dtype");
-    
+    TORCH_CHECK(routing_weights.scalar_type() == torch::kFloat, 
+                "routing_weights must be float32");
+    torch::Tensor result;
+
     // 根据输入类型调用相应的模板实例
     if (x.scalar_type() == torch::kFloat) {
-        return moe_q8_forward_impl<float>(
+        result = moe_q8_forward_impl<float>(
             x, routing_weights, selected_experts, gate_up_qs_stacked,
             gate_up_d_stacked, down_proj_qs_stacked, down_proj_d_stacked);
     } else if (x.scalar_type() == torch::kBFloat16) {
-        return moe_q8_forward_impl<at::BFloat16>(
+        result = moe_q8_forward_impl<at::BFloat16>(
             x, routing_weights, selected_experts, gate_up_qs_stacked,
             gate_up_d_stacked, down_proj_qs_stacked, down_proj_d_stacked);
     } else if (x.scalar_type() == torch::kHalf) {
-        return moe_q8_forward_impl<at::Half>(
+        result = moe_q8_forward_impl<at::Half>(
             x, routing_weights, selected_experts, gate_up_qs_stacked,
             gate_up_d_stacked, down_proj_qs_stacked, down_proj_d_stacked);
     } else {
         TORCH_CHECK(false, "Unsupported input dtype for moe_q8_forward. Supported dtypes are float32, bfloat16, and float16.");
     }
+    return result;
 }
+
+inline float fast_exp(float x)
+{
+    union {uint32_t i;float f;} v;
+    v.i=(1<<23)*(1.4426950409*x+126.94201519f);
+    return v.f;
+}
+
+template <typename T>
+void gating_top_k_softmax_impl(
+    const torch::Tensor& logits,
+    int top_k,
+    bool normalize,
+    torch::Tensor& routing_weights_out, // 输出张量，现在强制为 float32
+    torch::Tensor& selected_experts_out // 输出张量
+) {
+    const int num_tokens = logits.size(0);
+    const int num_experts = logits.size(1);
+
+    const T* logits_ptr = logits.data_ptr<T>();
+    float* weights_ptr = routing_weights_out.data_ptr<float>(); // [修改] 指针类型改为 float*
+    int32_t* experts_ptr = selected_experts_out.data_ptr<int32_t>();
+
+    #pragma omp parallel
+    {
+        // --- 线程私有缓冲区 ---
+        std::vector<int32_t> indices(num_experts);
+        std::vector<float> exp_vals(top_k);
+
+        #pragma omp for schedule(static)
+        for (int64_t i = 0; i < num_tokens; ++i) {
+            const T* current_logits = logits_ptr + i * num_experts;
+            
+            // 1. 初始化并部分排序索引以找到 top_k 专家
+            std::iota(indices.begin(), indices.end(), 0);
+            std::partial_sort(
+                indices.begin(),
+                indices.begin() + top_k,
+                indices.end(),
+                [&](int32_t a, int32_t b) {
+                    return static_cast<float>(current_logits[a]) > static_cast<float>(current_logits[b]);
+                }
+            );
+
+            // 2. 存储选择的专家索引
+            int32_t* current_experts = experts_ptr + i * top_k;
+            memcpy(current_experts, indices.data(), top_k * sizeof(int32_t));
+
+            // 3. 计算 Softmax 权重（现在总是在 float32 中进行）
+            float* current_weights = weights_ptr + i * top_k; // [修改] 指针类型改为 float*
+
+            if (normalize) {
+                // --- 路径 A: 仅在 TOP-K logits 上进行归一化 ---
+                
+                float max_logit = static_cast<float>(current_logits[indices[0]]);
+                
+                float sum_exp = 0.0f;
+                for (int k = 0; k < top_k; ++k) {
+                    exp_vals[k] = fast_exp(static_cast<float>(current_logits[indices[k]]) - max_logit);
+                    sum_exp += exp_vals[k];
+                }
+                
+                const float inv_sum_exp = (sum_exp > 0.0f) ? 1.0f / sum_exp : 0.0f;
+
+                for (int k = 0; k < top_k; ++k) {
+                    current_weights[k] = exp_vals[k] * inv_sum_exp;
+                }
+
+            } else {
+                // --- 路径 B: 在所有 logits 上进行标准 Softmax ---
+
+                float max_logit = -std::numeric_limits<float>::infinity();
+                for(int j=0; j < num_experts; ++j) {
+                    max_logit = std::max(max_logit, static_cast<float>(current_logits[j]));
+                }
+
+                float sum_exp = 0.0f;
+                for (int j = 0; j < num_experts; ++j) {
+                    sum_exp += fast_exp(static_cast<float>(current_logits[j]) - max_logit);
+                }
+
+                const float inv_sum_exp = (sum_exp > 0.0f) ? 1.0f / sum_exp : 0.0f;
+                
+                for (int k = 0; k < top_k; ++k) {
+                    float val = fast_exp(static_cast<float>(current_logits[indices[k]]) - max_logit);
+                    current_weights[k] = val * inv_sum_exp;
+                }
+            }
+        }
+    } // 结束并行区域
+}
+
+std::vector<torch::Tensor> gating_top_k_softmax(
+    const torch::Tensor& logits,
+    int top_k,
+    bool normalize
+) {
+    TORCH_CHECK(logits.dim() == 2, "Logits must be 2D");
+    TORCH_CHECK(logits.is_contiguous(), "Logits must be contiguous");
+    TORCH_CHECK(logits.device().is_cpu(), "Logits must be on CPU");
+    TORCH_CHECK(top_k > 0 && top_k <= logits.size(1), "top_k is out of range");
+
+    auto routing_weights_out = torch::empty({logits.size(0), top_k}, logits.options().dtype(torch::kFloat));
+    auto selected_experts_out = torch::empty({logits.size(0), top_k}, torch::kInt32);
+
+    if (logits.scalar_type() == torch::kHalf) {
+        gating_top_k_softmax_impl<at::Half>(logits, top_k, normalize, routing_weights_out, selected_experts_out);
+    } else if (logits.scalar_type() == torch::kBFloat16) {
+        gating_top_k_softmax_impl<at::BFloat16>(logits, top_k, normalize, routing_weights_out, selected_experts_out);
+    } else if (logits.scalar_type() == torch::kFloat) {
+        gating_top_k_softmax_impl<float>(logits, top_k, normalize, routing_weights_out, selected_experts_out);
+    } else {
+        TORCH_CHECK(false, "Unsupported dtype for gating_top_k_softmax. Supported: float16, bfloat16, float32.");
+    }
+
+    return {routing_weights_out, selected_experts_out};
+}
+
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("quantize_repack_weight", &quantize_repack_weight, "Quantize and repack weight for q8_gemm");
     m.def("q8_gemm", &q8_gemm, "q8_gemm kernel (A_fp32 @ B_q8.T)");
     m.def("moe_q8_forward", &moe_q8_forward, "Full MoE expert forward pass with int8 GEMM on CPU for float, bfloat16, and float16 inputs");
+    m.def("gating_top_k_softmax", &gating_top_k_softmax, "Perform Top-K and Softmax on CPU for MoE gating, returning new tensors");
 }
