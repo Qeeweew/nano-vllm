@@ -13,6 +13,8 @@ from nanovllm.layers.sampler import Sampler
 from nanovllm.utils.context import set_context, get_context, reset_context
 from nanovllm.utils.loader import load_model
 
+from moe_analyzer import MoEAnalyzer # <-- ADD THIS IMPORT
+
 class ModelRunner:
 
     def __init__(self, config: Config, rank: int, event: Event | list[Event]):
@@ -50,6 +52,7 @@ class ModelRunner:
         print(f"[Rank {self.rank}] Initializing Sampler complete. Starting model warmup...")
         start_time = time.time()
 
+        self.moe_tracker = None
         self.warmup_model()
 
         print(f"[Rank {self.rank}] Model warmup finished in {time.time() - start_time:.2f} seconds. Allocating KV cache...")
@@ -61,6 +64,20 @@ class ModelRunner:
 
         # torch.set_default_device("cpu")
         torch.set_default_dtype(default_dtype)
+
+    def start_moe_tracking(self, moe_layer_indices: list[int], num_experts: int, top_k: int):
+        """Initializes the layer-aware MoE tracker."""
+        print(f"[Rank {self.rank}] Starting MoE activation tracking for layers: {moe_layer_indices}.")
+        self.moe_tracker = MoEAnalyzer(moe_layer_indices, num_experts, top_k)
+
+    def stop_moe_tracking(self):
+        """Stops tracking and returns the collected results."""
+        if self.moe_tracker:
+            print(f"[Rank {self.rank}] Stopping MoE activation tracking.")
+            results = self.moe_tracker.get_results()
+            self.moe_tracker = None
+            return results
+        return None
 
     def exit(self):
         torch.cuda.synchronize()
@@ -198,7 +215,7 @@ class ModelRunner:
         cu_seqlens_q = torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         cu_seqlens_k = torch.tensor(cu_seqlens_k, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
-        set_context(True, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, None, block_tables)
+        set_context(True, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, None, block_tables, moe_tracker=self.moe_tracker)
         return input_ids, positions
 
     def prepare_decode(self, seqs: list[Sequence]):
@@ -216,7 +233,7 @@ class ModelRunner:
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         context_lens = torch.tensor(context_lens, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         block_tables = self.prepare_block_tables(seqs)
-        set_context(False, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables)
+        set_context(False, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables, moe_tracker=self.moe_tracker)
         return input_ids, positions
 
     def prepare_sample(self, seqs: list[Sequence]):
@@ -265,7 +282,7 @@ class ModelRunner:
         context_lens = torch.zeros(max_bs, dtype=torch.int32)
         block_tables = torch.zeros(max_bs, max_num_blocks, dtype=torch.int32)
         outputs = torch.zeros(max_bs, hf_config.hidden_size)
-        self.graph_bs = [1, 2, 4, 8] + list(range(16, max_bs + 1, 16))
+        self.graph_bs = [1, 2, 3, 4, 5, 6, 7, 8] + list(range(16, max_bs + 1, 16))
         self.graphs = {}
         self.graph_pool = None
 

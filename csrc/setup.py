@@ -1,21 +1,24 @@
 import os
 from setuptools import setup
-from torch.utils.cpp_extension import BuildExtension, CppExtension
+from torch.utils.cpp_extension import BuildExtension, CUDAExtension
 
-# Determine compiler based on availability
-cxx_compiler = "g++"
-if os.environ.get("CXX") is None:
-    os.environ["CXX"] = cxx_compiler
+cxx_compiler = os.environ.get("CXX", "g++")
+os.environ["CXX"] = cxx_compiler
 
 setup(
     name='nanovllm_ext',
     ext_modules=[
-        CppExtension(
+        CUDAExtension(
             'nanovllm_ext',
-            ['q8_gemm.cpp'],
-            # Use -O3 for optimization, -march=native to enable all available CPU instructions (like AVX2),
-            # and -fopenmp for OpenMP, which is used by ATen's parallelism backend on CPU.
-            extra_compile_args=['-O3', '-ffast-math', '-Wall', '-march=native', '-fopenmp'],
+            ['q8_gemm.cpp'],  # Keep the .cpp extension
+            
+            # --- ADD THIS LINE ---
+            define_macros=[('WITH_CUDA', None)],
+
+            extra_compile_args={
+                'cxx': ['-O3', '-ffast-math', '-Wall', '-march=native', '-fopenmp'],
+                'nvcc': ['-O3', '--use_fast_math'] 
+            },
             extra_link_args=['-fopenmp'],
         ),
     ],

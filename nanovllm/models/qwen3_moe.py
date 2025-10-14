@@ -28,10 +28,11 @@ class Qwen3MoeDecoderLayer(nn.Module):
         # Conditionally instantiate MoE or dense MLP
         if config.num_experts > 0 and (layer_idx + 1) % config.decoder_sparse_step == 0:
             self.mlp = SparseMoeBlock(
+                layer_idx=layer_idx,
                 hidden_size=config.hidden_size,
                 num_experts=config.num_experts,
                 top_k=config.num_experts_per_tok,
-                intermediate_size=config.moe_intermediate_size, # Qwen3-MoE uses moe_intermediate_size
+                intermediate_size=config.moe_intermediate_size,
                 norm_top_k_prob=getattr(config, "norm_top_k_prob", False)
             )
         else:

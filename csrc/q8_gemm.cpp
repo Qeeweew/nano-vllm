@@ -1080,9 +1080,20 @@ torch::Tensor moe_q8_forward(
 
 inline float fast_exp(float x)
 {
-    union {uint32_t i;float f;} v;
-    v.i=(1<<23)*(1.4426950409*x+126.94201519f);
-    return v.f;
+    const float LOG2E = 1.4426950409f; 
+    const float LN2 = 0.6931471806f;
+    x = std::max(-87.3f, x);
+    float k_float = floorf(x * LOG2E + 0.5f);
+    int k = (int)k_float;
+    float r = x - k_float * LN2;
+    const float c0 = 0.99995040f;
+    const float c1 = 1.00015572f;
+    const float c2 = 0.50426726f;
+    const float c3 = 0.16522747f;
+    float exp_r = c0 + r * (c1 + r * (c2 + r * c3));
+    union {uint32_t i; float f;} v;
+    v.i = (uint32_t)(k + 127) << 23;
+    return v.f * exp_r;
 }
 
 template <typename T>
@@ -1104,7 +1115,8 @@ void gating_top_k_softmax_impl(
     {
         // --- 线程私有缓冲区 ---
         std::vector<int32_t> indices(num_experts);
-        std::vector<float> exp_vals(top_k);
+        constexpr int MAX_TOP_K = 8;
+        float exp_vals[MAX_TOP_K];
 
         #pragma omp for schedule(static)
         for (int64_t i = 0; i < num_tokens; ++i) {
@@ -1117,7 +1129,7 @@ void gating_top_k_softmax_impl(
                 indices.begin() + top_k,
                 indices.end(),
                 [&](int32_t a, int32_t b) {
-                    return static_cast<float>(current_logits[a]) > static_cast<float>(current_logits[b]);
+                    return current_logits[a] > current_logits[b];
                 }
             );
 
@@ -1148,11 +1160,7 @@ void gating_top_k_softmax_impl(
             } else {
                 // --- 路径 B: 在所有 logits 上进行标准 Softmax ---
 
-                float max_logit = -std::numeric_limits<float>::infinity();
-                for(int j=0; j < num_experts; ++j) {
-                    max_logit = std::max(max_logit, static_cast<float>(current_logits[j]));
-                }
-
+                float max_logit = static_cast<float>(current_logits[indices[0]]);
                 float sum_exp = 0.0f;
                 for (int j = 0; j < num_experts; ++j) {
                     sum_exp += fast_exp(static_cast<float>(current_logits[j]) - max_logit);
@@ -1177,7 +1185,7 @@ std::vector<torch::Tensor> gating_top_k_softmax(
     TORCH_CHECK(logits.dim() == 2, "Logits must be 2D");
     TORCH_CHECK(logits.is_contiguous(), "Logits must be contiguous");
     TORCH_CHECK(logits.device().is_cpu(), "Logits must be on CPU");
-    TORCH_CHECK(top_k > 0 && top_k <= logits.size(1), "top_k is out of range");
+    TORCH_CHECK(top_k > 0 && top_k <= logits.size(1) && top_k <= 8, "top_k is out of range");
 
     auto routing_weights_out = torch::empty({logits.size(0), top_k}, logits.options().dtype(torch::kFloat));
     auto selected_experts_out = torch::empty({logits.size(0), top_k}, torch::kInt32);
@@ -1195,10 +1203,118 @@ std::vector<torch::Tensor> gating_top_k_softmax(
     return {routing_weights_out, selected_experts_out};
 }
 
+#ifdef WITH_CUDA
+#include <cuda_runtime.h> // <-- CORRECT: Include at the top level.
+
+// This function combines the logic of the two original C++ calls.
+// It performs gating and then the MoE expert computation.
+template <typename T>
+void gating_and_moe_forward_cpu_task(
+    torch::Tensor x,
+    torch::Tensor logits,
+    torch::Tensor gate_up_qs_stacked,
+    torch::Tensor gate_up_d_stacked,
+    torch::Tensor down_proj_qs_stacked,
+    torch::Tensor down_proj_d_stacked,
+    int top_k,
+    bool normalize
+) {
+    // ... (implementation is the same)
+    auto routing_weights = torch::empty({logits.size(0), top_k}, torch::kFloat);
+    auto selected_experts = torch::empty({logits.size(0), top_k}, torch::kInt32);
+
+    gating_top_k_softmax_impl<T>(logits, top_k, normalize, routing_weights, selected_experts);
+
+    moe_q8_forward_impl<T>(
+        x,
+        routing_weights,
+        selected_experts,
+        gate_up_qs_stacked,
+        gate_up_d_stacked,
+        down_proj_qs_stacked,
+        down_proj_d_stacked
+    );
+}
+
+// A helper struct to pass all our data through the void* userData of the CUDA callback.
+struct CpuMoeTaskData {
+    // ... (definition is the same)
+    torch::Tensor x;
+    torch::Tensor logits;
+    torch::Tensor gate_up_qs_stacked;
+    torch::Tensor gate_up_d_stacked;
+    torch::Tensor down_proj_qs_stacked;
+    torch::Tensor down_proj_d_stacked;
+    int top_k;
+    bool normalize;
+};
+
+// The actual function that will be executed by a CPU thread, managed by the CUDA driver.
+void CUDART_CB cpu_moe_callback(void* userData) {
+    // ... (implementation is the same)
+    auto* data = static_cast<CpuMoeTaskData*>(userData);
+    if (data->x.scalar_type() == torch::kFloat) {
+        gating_and_moe_forward_cpu_task<float>(
+            data->x, data->logits, data->gate_up_qs_stacked, data->gate_up_d_stacked,
+            data->down_proj_qs_stacked, data->down_proj_d_stacked, data->top_k, data->normalize);
+    } else if (data->x.scalar_type() == torch::kBFloat16) {
+        gating_and_moe_forward_cpu_task<at::BFloat16>(
+            data->x, data->logits, data->gate_up_qs_stacked, data->gate_up_d_stacked,
+            data->down_proj_qs_stacked, data->down_proj_d_stacked, data->top_k, data->normalize);
+    } else if (data->x.scalar_type() == torch::kHalf) {
+        gating_and_moe_forward_cpu_task<at::Half>(
+            data->x, data->logits, data->gate_up_qs_stacked, data->gate_up_d_stacked,
+            data->down_proj_qs_stacked, data->down_proj_d_stacked, data->top_k, data->normalize);
+    }
+    delete data;
+}
+
+// The Python-facing function that enqueues the host function call into the CUDA stream.
+void launch_gating_and_moe_cpu_task(
+    torch::Tensor x,
+    torch::Tensor logits,
+    torch::Tensor gate_up_qs_stacked,
+    torch::Tensor gate_up_d_stacked,
+    torch::Tensor down_proj_qs_stacked,
+    torch::Tensor down_proj_d_stacked,
+    int top_k,
+    bool normalize,
+    uintptr_t stream_ptr
+) {
+    // ... (implementation is the same)
+    TORCH_CHECK(x.is_pinned(), "Input 'x' must be in pinned memory");
+    TORCH_CHECK(logits.is_pinned(), "Input 'logits' must be in pinned memory");
+    TORCH_CHECK(x.scalar_type() == logits.scalar_type(), "x and logits must have the same dtype");
+    
+    auto supported_dtype = x.scalar_type() == torch::kFloat || 
+                           x.scalar_type() == torch::kBFloat16 || 
+                           x.scalar_type() == torch::kHalf;
+    TORCH_CHECK(supported_dtype, "Unsupported dtype. Supported: float32, bfloat16, float16.");
+
+    auto* task_data = new CpuMoeTaskData{
+        x, logits, gate_up_qs_stacked, gate_up_d_stacked,
+        down_proj_qs_stacked, down_proj_d_stacked, top_k, normalize
+    };
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+    cudaError_t err = cudaLaunchHostFunc(stream, cpu_moe_callback, task_data);
+    TORCH_CHECK(err == cudaSuccess, "cudaLaunchHostFunc failed: ", cudaGetErrorString(err));
+}
+
+#endif // WITH_CUDA
+
+
+// ==========================================================================================
+// PYBIND11 MODULE DEFINITION - NOW CLEANED UP
+// ==========================================================================================
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("quantize_repack_weight", &quantize_repack_weight, "Quantize and repack weight for q8_gemm");
     m.def("q8_gemm", &q8_gemm, "q8_gemm kernel (A_fp32 @ B_q8.T)");
     m.def("moe_q8_forward", &moe_q8_forward, "Full MoE expert forward pass with int8 GEMM on CPU for float, bfloat16, and float16 inputs");
     m.def("gating_top_k_softmax", &gating_top_k_softmax, "Perform Top-K and Softmax on CPU for MoE gating, returning new tensors");
+
+    // Add the new function to the pybind module, protected by the same preprocessor guard.
+    #ifdef WITH_CUDA
+    m.def("launch_gating_and_moe_cpu_task", &launch_gating_and_moe_cpu_task, "Launches the combined MoE CPU computation in a CUDA stream.");
+    #endif
 }

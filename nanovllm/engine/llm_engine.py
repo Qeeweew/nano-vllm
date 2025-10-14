@@ -18,6 +18,7 @@ class LLMEngine:
         config_fields = {field.name for field in fields(Config)}
         config_kwargs = {k: v for k, v in kwargs.items() if k in config_fields}
         config = Config(model, **config_kwargs)
+        self.config = config
         self.ps = []
         self.events = []
         ctx = mp.get_context("spawn")
@@ -91,3 +92,41 @@ class LLMEngine:
         if use_tqdm:
             pbar.close()
         return outputs
+    
+    def start_moe_tracking(self):
+        """Identifies MoE layers and starts layer-wise tracking."""
+        hf_config = self.config.hf_config
+        num_experts = getattr(hf_config, 'num_experts', 0)
+        top_k = getattr(hf_config, 'num_experts_per_tok', 0)
+        
+        if num_experts == 0 or top_k == 0:
+            raise ValueError("The loaded model does not appear to be a Mixture-of-Experts model.")
+        
+        # --- LOGIC TO IDENTIFY MoE LAYERS ---
+        moe_layer_indices = []
+        # This logic is specific to Qwen3-MoE. Adapt if using other architectures.
+        if hasattr(hf_config, 'decoder_sparse_step'):
+            for i in range(hf_config.num_hidden_layers):
+                if (i + 1) % hf_config.decoder_sparse_step == 0:
+                    moe_layer_indices.append(i)
+        else:
+             # Fallback for models like Olmoe where all layers might be MoE
+             # This part might need adjustment based on the model architecture
+             print("Warning: 'decoder_sparse_step' not found in config. Assuming all layers with experts are MoE layers.")
+             # A more robust check would inspect the model structure itself.
+             # For now, we assume all layers are potential MoE layers if num_experts > 0.
+             moe_layer_indices = list(range(hf_config.num_hidden_layers))
+
+        if not moe_layer_indices:
+            raise ValueError("Could not identify any MoE layers in the model configuration.")
+        # --------------------------------------
+            
+        self.model_runner.call("start_moe_tracking", moe_layer_indices, num_experts, top_k)
+
+
+    def stop_moe_tracking(self):
+        """Stops tracking and collects the results from the primary model runner."""
+        # Only rank 0 does sampling and has the full picture, so we get results from it.
+        results = self.model_runner.call("stop_moe_tracking")
+        return results
+

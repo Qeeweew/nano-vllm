@@ -16,6 +16,7 @@ class SparseMoeBlock(nn.Module):
     """
     def __init__(
         self,
+        layer_idx: int,
         hidden_size: int,
         num_experts: int,
         top_k: int,
@@ -23,6 +24,7 @@ class SparseMoeBlock(nn.Module):
         norm_top_k_prob: bool = False,
     ):
         super().__init__()
+        self.layer_idx = layer_idx
         self.num_experts = num_experts
         self.top_k = top_k
         self.hidden_size = hidden_size
@@ -58,7 +60,18 @@ class SparseMoeBlock(nn.Module):
         """
         # === 1. GPU Part: Calculate router logits ===
         router_logits = self.gate(hidden_states)
-        
+
+        ctx = get_context()
+        if ctx.moe_tracker and not ctx.is_prefill:
+            with torch.no_grad():
+                _, top_indices = torch.topk(router_logits, self.top_k, dim=-1)
+                num_sequences = hidden_states.shape[0]
+                sequence_indices = torch.arange(num_sequences, device=hidden_states.device)
+                
+                # --- PASS self.layer_idx to the logger ---
+                ctx.moe_tracker.log_activations(self.layer_idx, top_indices, sequence_indices)
+                # -----------------------------------------
+ 
         # === 2. Transfer Data to CPU (Graphable Operation) ===
         # Initiate non-blocking copies of hidden states and logits to pinned CPU memory.
         pinned_hidden.copy_(hidden_states, non_blocking=True)
@@ -79,28 +92,19 @@ class SparseMoeBlock(nn.Module):
         # --- Phase 1: GPU Computation ---
         self.forward_pre_expert(hidden_states, pinned_hidden, pinned_logits)
         
-        # --- Synchronization Point ---
-        torch.cuda.synchronize()
+        # --- Phase 2: Enqueue CPU Computation into the CUDA stream ---
+        stream = torch.cuda.current_stream().cuda_stream
 
-        # --- Phase 2: CPU Computation ---
-
-        # === 1. CPU Gating: Call C++ kernel which returns new CPU tensors ===
-        routing_weights, selected_experts = nanovllm_ext.gating_top_k_softmax(
-            pinned_logits,
-            self.top_k,
-            self.norm_top_k_prob
-        )
-        
-        # === 2. CPU Expert Computation ===
-        # The result is written in-place into pinned_hidden, which is then returned.
-        nanovllm_ext.moe_q8_forward(
-            pinned_hidden,
-            routing_weights,
-            selected_experts,
-            self.gate_up_qs_stacked,
+        nanovllm_ext.launch_gating_and_moe_cpu_task(
+            pinned_hidden,           # The buffer to be modified in-place
+            pinned_logits,           # Input for gating
+            self.gate_up_qs_stacked, # All expert weights...
             self.gate_up_d_stacked,
             self.down_proj_qs_stacked,
-            self.down_proj_d_stacked
+            self.down_proj_d_stacked,
+            self.top_k,              # Gating parameters...
+            self.norm_top_k_prob,
+            stream                   # The CUDA stream to enqueue the task into
         )
 
         # Asynchronously copy the final result back to the GPU.
