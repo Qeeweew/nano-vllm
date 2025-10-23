@@ -633,8 +633,6 @@ static void pack_A_q8_0_from_quantized_indirect(
     });
 }
 
-// 放置在 moe_q8_forward_impl 函数之前
-
 // Helper to align memory addresses to 64 bytes
 static inline size_t align_to_64(size_t n) {
     return (n + 63) & ~63;
@@ -717,8 +715,8 @@ static void moe_q8_forward_n_axis_parallel(
     const MoETokenInfo* token_map, int total_expert_tokens,
     int hidden_dim, int intermediate_size, int intermediate_size_x2,
     const int8_t* x_qs, const float* x_d,
-    torch::Tensor& gate_up_qs_stacked, torch::Tensor& gate_up_d_stacked,
-    torch::Tensor& down_proj_qs_stacked, torch::Tensor& down_proj_d_stacked,
+    const int8_t* gate_up_qs_stacked_ptr, const at::Half* gate_up_d_stacked_ptr,
+    const int8_t* down_proj_qs_stacked_ptr, const at::Half* down_proj_d_stacked_ptr,
     float* expert_intermediate2 // Output buffer
 ) {
     int num_threads = omp_get_max_threads();
@@ -785,10 +783,10 @@ static void moe_q8_forward_n_axis_parallel(
         float* my_A1_d_ptr = packed_A1_d_all + m_ceil_offset[active_exp_id] * hidden_dim_k_blocks;
         int8_t* my_A2_qs_ptr = packed_A2_qs_all + m_ceil_offset[active_exp_id] * intermediate_size;
         float* my_A2_d_ptr = packed_A2_d_all + m_ceil_offset[active_exp_id] * intermediate_dim_k_blocks;
-        int8_t* gate_up_qs_ptr = gate_up_qs_stacked.data_ptr<int8_t>() + exp_id * intermediate_size_x2 * hidden_dim;
-        at::Half* gate_up_d_ptr = gate_up_d_stacked.data_ptr<at::Half>() + exp_id * intermediate_size_x2 * hidden_dim_k_blocks;
-        int8_t* down_proj_qs_ptr = down_proj_qs_stacked.data_ptr<int8_t>() + exp_id * hidden_dim * intermediate_size;
-        at::Half* down_proj_d_ptr = down_proj_d_stacked.data_ptr<at::Half>() + exp_id * hidden_dim * intermediate_dim_k_blocks;
+        const int8_t* gate_up_qs_ptr = gate_up_qs_stacked_ptr + exp_id * intermediate_size_x2 * hidden_dim;
+        const at::Half* gate_up_d_ptr = gate_up_d_stacked_ptr + exp_id * intermediate_size_x2 * hidden_dim_k_blocks;
+        const int8_t* down_proj_qs_ptr = down_proj_qs_stacked_ptr + exp_id * hidden_dim * intermediate_size;
+        const at::Half* down_proj_d_ptr = down_proj_d_stacked_ptr + exp_id * hidden_dim * intermediate_dim_k_blocks;
 
         if (t_idx == 0) {
             pack_A_q8_0_from_quantized_indirect<ExecutionPolicy::Sequential>(
@@ -863,13 +861,10 @@ static void moe_q8_forward_task_parallel(
     const MoETokenInfo* token_map, int total_expert_tokens,
     int hidden_dim, int intermediate_size, int intermediate_size_x2,
     const int8_t* x_qs, const float* x_d,
-    torch::Tensor& gate_up_qs_stacked, torch::Tensor& gate_up_d_stacked,
-    torch::Tensor& down_proj_qs_stacked, torch::Tensor& down_proj_d_stacked,
+    const int8_t* gate_up_qs_stacked_ptr, const at::Half* gate_up_d_stacked_ptr,
+    const int8_t* down_proj_qs_stacked_ptr, const at::Half* down_proj_d_stacked_ptr,
     float* expert_intermediate2 // Output buffer
-) {
-    const int hidden_dim_k_blocks = hidden_dim / QK8_0;
-    const int intermediate_dim_k_blocks = intermediate_size / QK8_0;
-
+) { 
     constexpr int M_BLOCK = 32;
     struct MoeTask { int expert_id, num_tokens, global_token_start_pos; };
     std::vector<MoeTask> tasks;
@@ -882,16 +877,17 @@ static void moe_q8_forward_task_parallel(
             tasks.push_back({exp_id, std::min(M_BLOCK, count - offset), start_pos + offset});
         }
     }
+    int task_count = static_cast<int>(tasks.size());
 
     #pragma omp parallel for schedule(dynamic)
-    for (int64_t i = 0; i < tasks.size(); ++i) {
+    for (int i = 0; i < task_count; ++i) {
         const auto& task = tasks[i];
         const int exp_id = task.expert_id, count = task.num_tokens, global_start_pos = task.global_token_start_pos;
 
-        int8_t* gate_up_qs_ptr = gate_up_qs_stacked.data_ptr<int8_t>() + exp_id * intermediate_size_x2 * hidden_dim;
-        at::Half* gate_up_d_ptr = gate_up_d_stacked.data_ptr<at::Half>() + exp_id * intermediate_size_x2 * hidden_dim_k_blocks;
-        int8_t* down_proj_qs_ptr = down_proj_qs_stacked.data_ptr<int8_t>() + exp_id * hidden_dim * intermediate_size;
-        at::Half* down_proj_d_ptr = down_proj_d_stacked.data_ptr<at::Half>() + exp_id * hidden_dim * intermediate_dim_k_blocks;
+        const int8_t* gate_up_qs_ptr = gate_up_qs_stacked_ptr + exp_id * intermediate_size_x2 * hidden_dim;
+        const at::Half* gate_up_d_ptr = gate_up_d_stacked_ptr + exp_id * intermediate_size_x2 * (hidden_dim / QK8_0);
+        const int8_t* down_proj_qs_ptr = down_proj_qs_stacked_ptr + exp_id * hidden_dim * intermediate_size;
+        const at::Half* down_proj_d_ptr = down_proj_d_stacked_ptr + exp_id * hidden_dim * (intermediate_size / QK8_0);
 
         pack_A_q8_0_from_quantized_indirect<ExecutionPolicy::Sequential>(
             count, hidden_dim, x_qs, x_d, token_map, global_start_pos,
@@ -918,24 +914,21 @@ static void moe_q8_forward_task_parallel(
 }
 
 template <typename T>
-torch::Tensor moe_q8_forward_impl(
-    torch::Tensor x,
-    torch::Tensor routing_weights,
-    torch::Tensor selected_experts,
-    torch::Tensor gate_up_qs_stacked,
-    torch::Tensor gate_up_d_stacked,
-    torch::Tensor down_proj_qs_stacked,
-    torch::Tensor down_proj_d_stacked
+void moe_q8_forward_ptr_impl(
+    T* x_ptr, // Input/Output
+    const float* routing_weights_ptr,
+    const int32_t* selected_experts_ptr,
+    const int8_t* gate_up_qs_stacked_ptr,
+    const at::Half* gate_up_d_stacked_ptr,
+    const int8_t* down_proj_qs_stacked_ptr,
+    const at::Half* down_proj_d_stacked_ptr,
+    int64_t num_tokens, int64_t hidden_dim, int64_t num_experts,
+    int64_t intermediate_size, int64_t intermediate_size_x2,
+    int64_t top_k
 ) {
     // =======================================================================
     // 1. PREPROCESSING & GATHER/SCATTER MAP CREATION
     // =======================================================================
-    const auto num_tokens = x.size(0);
-    const auto hidden_dim = x.size(1);
-    const auto num_experts = gate_up_qs_stacked.size(0);
-    const auto intermediate_size_x2 = gate_up_qs_stacked.size(1);
-    const auto intermediate_size = down_proj_qs_stacked.size(2);
-    const auto top_k = selected_experts.size(1);
     const auto hidden_dim_k_blocks = hidden_dim / QK8_0;
 
     std::vector<int> expert_counts(num_experts, 0);
@@ -944,15 +937,16 @@ torch::Tensor moe_q8_forward_impl(
     std::vector<int32_t> scatter_map;
 
     preprocess_moe_routing(
-        num_experts, top_k, num_tokens, selected_experts.data_ptr<int32_t>(),
+        num_experts, top_k, num_tokens, selected_experts_ptr, // Use raw pointer
         expert_counts, expert_starts, token_map, scatter_map
     );
 
     const int total_expert_tokens = expert_starts[num_experts];
     if (total_expert_tokens == 0) {
-        x.zero_();
-        return x;
+        memset(x_ptr, 0, num_tokens * hidden_dim * sizeof(T)); // Zero out the buffer
+        return;
     }
+
 
     // =======================================================================
     // 2. ALLOCATE BUFFERS
@@ -972,7 +966,7 @@ torch::Tensor moe_q8_forward_impl(
         ws.ensure_size(M_BLOCK, hidden_dim, intermediate_size, intermediate_size_x2);
         #pragma omp for
         for (int64_t i = 0; i < num_tokens; ++i) {
-            const T* src_row = x.data_ptr<T>() + i * hidden_dim;
+            const T* src_row = x_ptr + i * hidden_dim; // Use raw pointer
             for (int j = 0; j < hidden_dim; ++j) {
                 ws.temp_row_buffer[j] = static_cast<float>(src_row[j]);
             }
@@ -1001,23 +995,25 @@ torch::Tensor moe_q8_forward_impl(
         moe_q8_forward_n_axis_parallel(
             num_experts, expert_counts, expert_starts, active_expert_ids,
             token_map.data(), total_expert_tokens, hidden_dim, intermediate_size, intermediate_size_x2,
-            x_qs, x_d, gate_up_qs_stacked, gate_up_d_stacked,
-            down_proj_qs_stacked, down_proj_d_stacked, expert_intermediate2
+            x_qs, x_d, 
+            gate_up_qs_stacked_ptr, reinterpret_cast<const at::Half*>(gate_up_d_stacked_ptr), // Pass raw pointers
+            down_proj_qs_stacked_ptr, reinterpret_cast<const at::Half*>(down_proj_d_stacked_ptr),
+            expert_intermediate2
         );
     } else if (active_experts_count > 0) {
         moe_q8_forward_task_parallel(
             num_experts, expert_counts, expert_starts,
             token_map.data(), total_expert_tokens, hidden_dim, intermediate_size, intermediate_size_x2,
-            x_qs, x_d, gate_up_qs_stacked, gate_up_d_stacked,
-            down_proj_qs_stacked, down_proj_d_stacked, expert_intermediate2
+            x_qs, x_d, 
+            gate_up_qs_stacked_ptr, reinterpret_cast<const at::Half*>(gate_up_d_stacked_ptr), // Pass raw pointers
+            down_proj_qs_stacked_ptr, reinterpret_cast<const at::Half*>(down_proj_d_stacked_ptr),
+            expert_intermediate2
         );
     }
-
     // =======================================================================
     // 5. SCATTER AND WEIGHTING (COMMON STEP)
     // =======================================================================
-    T* final_output_ptr = x.data_ptr<T>();
-    const float* routing_weights_ptr = routing_weights.data_ptr<float>();
+    T* final_output_ptr = x_ptr; // Use raw pointer
 
     #pragma omp parallel for
     for (int64_t t = 0; t < num_tokens; ++t) {
@@ -1041,6 +1037,33 @@ torch::Tensor moe_q8_forward_impl(
     std::free(x_qs);
     std::free(x_d);
     std::free(expert_intermediate2);
+}
+
+template <typename T>
+torch::Tensor moe_q8_forward_impl(
+    torch::Tensor x,
+    torch::Tensor routing_weights,
+    torch::Tensor selected_experts,
+    torch::Tensor gate_up_qs_stacked,
+    torch::Tensor gate_up_d_stacked,
+    torch::Tensor down_proj_qs_stacked,
+    torch::Tensor down_proj_d_stacked
+) {
+    moe_q8_forward_ptr_impl<T>(
+        x.data_ptr<T>(),
+        routing_weights.data_ptr<float>(),
+        selected_experts.data_ptr<int32_t>(),
+        gate_up_qs_stacked.data_ptr<int8_t>(),
+        reinterpret_cast<at::Half*>(gate_up_d_stacked.data_ptr()),
+        down_proj_qs_stacked.data_ptr<int8_t>(),
+        reinterpret_cast<at::Half*>(down_proj_d_stacked.data_ptr()),
+        x.size(0),
+        x.size(1),
+        gate_up_qs_stacked.size(0),
+        down_proj_qs_stacked.size(2),
+        gate_up_qs_stacked.size(1),
+        selected_experts.size(1)
+    );
     return x;
 }
 
@@ -1097,23 +1120,18 @@ inline float fast_exp(float x)
 }
 
 template <typename T>
-void gating_top_k_softmax_impl(
-    const torch::Tensor& logits,
+void gating_top_k_softmax_ptr_impl(
+    const T* logits_ptr,
+    int num_tokens,
+    int num_experts,
     int top_k,
     bool normalize,
-    torch::Tensor& routing_weights_out, // 输出张量，现在强制为 float32
-    torch::Tensor& selected_experts_out // 输出张量
+    float* routing_weights_out_ptr, // Output pointer
+    int32_t* selected_experts_out_ptr  // Output pointer
 ) {
-    const int num_tokens = logits.size(0);
-    const int num_experts = logits.size(1);
-
-    const T* logits_ptr = logits.data_ptr<T>();
-    float* weights_ptr = routing_weights_out.data_ptr<float>(); // [修改] 指针类型改为 float*
-    int32_t* experts_ptr = selected_experts_out.data_ptr<int32_t>();
-
     #pragma omp parallel
     {
-        // --- 线程私有缓冲区 ---
+        // --- Thread-local buffers ---
         std::vector<int32_t> indices(num_experts);
         constexpr int MAX_TOP_K = 8;
         float exp_vals[MAX_TOP_K];
@@ -1122,7 +1140,7 @@ void gating_top_k_softmax_impl(
         for (int64_t i = 0; i < num_tokens; ++i) {
             const T* current_logits = logits_ptr + i * num_experts;
             
-            // 1. 初始化并部分排序索引以找到 top_k 专家
+            // 1. Initialize and partially sort indices to find top_k experts
             std::iota(indices.begin(), indices.end(), 0);
             std::partial_sort(
                 indices.begin(),
@@ -1133,48 +1151,59 @@ void gating_top_k_softmax_impl(
                 }
             );
 
-            // 2. 存储选择的专家索引
-            int32_t* current_experts = experts_ptr + i * top_k;
+            // 2. Store selected expert indices
+            int32_t* current_experts = selected_experts_out_ptr + i * top_k;
             memcpy(current_experts, indices.data(), top_k * sizeof(int32_t));
 
-            // 3. 计算 Softmax 权重（现在总是在 float32 中进行）
-            float* current_weights = weights_ptr + i * top_k; // [修改] 指针类型改为 float*
+            // 3. Compute Softmax weights (always in float32)
+            float* current_weights = routing_weights_out_ptr + i * top_k;
 
             if (normalize) {
-                // --- 路径 A: 仅在 TOP-K logits 上进行归一化 ---
-                
+                // --- Path A: Normalize over TOP-K logits only ---
                 float max_logit = static_cast<float>(current_logits[indices[0]]);
-                
                 float sum_exp = 0.0f;
                 for (int k = 0; k < top_k; ++k) {
                     exp_vals[k] = fast_exp(static_cast<float>(current_logits[indices[k]]) - max_logit);
                     sum_exp += exp_vals[k];
                 }
-                
                 const float inv_sum_exp = (sum_exp > 0.0f) ? 1.0f / sum_exp : 0.0f;
-
                 for (int k = 0; k < top_k; ++k) {
                     current_weights[k] = exp_vals[k] * inv_sum_exp;
                 }
-
             } else {
-                // --- 路径 B: 在所有 logits 上进行标准 Softmax ---
-
+                // --- Path B: Standard Softmax over all logits ---
                 float max_logit = static_cast<float>(current_logits[indices[0]]);
                 float sum_exp = 0.0f;
                 for (int j = 0; j < num_experts; ++j) {
                     sum_exp += fast_exp(static_cast<float>(current_logits[j]) - max_logit);
                 }
-
                 const float inv_sum_exp = (sum_exp > 0.0f) ? 1.0f / sum_exp : 0.0f;
-                
                 for (int k = 0; k < top_k; ++k) {
                     float val = fast_exp(static_cast<float>(current_logits[indices[k]]) - max_logit);
                     current_weights[k] = val * inv_sum_exp;
                 }
             }
         }
-    } // 结束并行区域
+    } // End parallel region
+}
+
+template <typename T>
+void gating_top_k_softmax_impl(
+    const torch::Tensor& logits,
+    int top_k,
+    bool normalize,
+    torch::Tensor& routing_weights_out,
+    torch::Tensor& selected_experts_out
+) {
+    gating_top_k_softmax_ptr_impl<T>(
+        logits.data_ptr<T>(),
+        logits.size(0),
+        logits.size(1),
+        top_k,
+        normalize,
+        routing_weights_out.data_ptr<float>(),
+        selected_experts_out.data_ptr<int32_t>()
+    );
 }
 
 std::vector<torch::Tensor> gating_top_k_softmax(
@@ -1204,117 +1233,177 @@ std::vector<torch::Tensor> gating_top_k_softmax(
 }
 
 #ifdef WITH_CUDA
-#include <cuda_runtime.h> // <-- CORRECT: Include at the top level.
+#include <cuda_runtime.h> // For cudaLaunchHostFunc
 
-// This function combines the logic of the two original C++ calls.
-// It performs gating and then the MoE expert computation.
+// Step 1: Define a struct to hold raw data. NO py::object or torch::Tensor here.
+// This is the data packet that will be passed from the GIL-holding world
+// to the GIL-free world.
+struct MoEArgs {
+    // Pointers to the data buffers (all reside in pinned CPU memory)
+    void*           pinned_hidden_ptr;
+    void*           pinned_logits_ptr;
+
+    // Pointers to expert weights (reside in standard CPU memory)
+    const int8_t*   gate_up_qs_ptr;
+    const void*     gate_up_d_ptr; // Can be at::Half
+    const int8_t*   down_proj_qs_ptr;
+    const void*     down_proj_d_ptr; // Can be at::Half
+
+    // Dimensions
+    int64_t num_tokens;
+    int64_t hidden_dim;
+    int64_t num_experts;
+    int64_t intermediate_size;
+    int64_t intermediate_size_x2;
+
+    // Configuration
+    int top_k;
+    bool normalize;
+
+    // Metadata needed to correctly interpret the void* pointers
+    at::ScalarType dtype;
+
+    bool keep_args; // Whether to keep the args struct after execution
+};
+
+// Step 2: Create the GIL-free computation function.
+// This function contains the core logic but operates only on raw pointers and primitive types.
 template <typename T>
-void gating_and_moe_forward_cpu_task(
-    torch::Tensor x,
-    torch::Tensor logits,
-    torch::Tensor gate_up_qs_stacked,
-    torch::Tensor gate_up_d_stacked,
-    torch::Tensor down_proj_qs_stacked,
-    torch::Tensor down_proj_d_stacked,
-    int top_k,
-    bool normalize
-) {
-    // ... (implementation is the same)
-    auto routing_weights = torch::empty({logits.size(0), top_k}, torch::kFloat);
-    auto selected_experts = torch::empty({logits.size(0), top_k}, torch::kInt32);
+void gating_and_moe_computation_gil_free(MoEArgs* args) {
+    // --- Part A: Gating using raw pointers ---
+    // Allocate temporary local tensors for the gating outputs. This is safe and self-contained.
+    auto routing_weights = torch::empty({args->num_tokens, args->top_k}, torch::kFloat);
+    auto selected_experts = torch::empty({args->num_tokens, args->top_k}, torch::kInt32);
 
-    gating_top_k_softmax_impl<T>(logits, top_k, normalize, routing_weights, selected_experts);
+    // Call the pointer-based gating implementation directly. NO from_blob needed.
+    gating_top_k_softmax_ptr_impl<T>(
+        static_cast<const T*>(args->pinned_logits_ptr),
+        args->num_tokens,
+        args->num_experts,
+        args->top_k,
+        args->normalize,
+        routing_weights.data_ptr<float>(),
+        selected_experts.data_ptr<int32_t>()
+    );
 
-    moe_q8_forward_impl<T>(
-        x,
-        routing_weights,
-        selected_experts,
-        gate_up_qs_stacked,
-        gate_up_d_stacked,
-        down_proj_qs_stacked,
-        down_proj_d_stacked
+    // --- Part B: MoE forward using raw pointers ---
+    // Call the pointer-based MoE implementation directly. NO from_blob needed.
+    // The result is written in-place into the `pinned_hidden_ptr` buffer.
+    moe_q8_forward_ptr_impl<T>(
+        static_cast<T*>(args->pinned_hidden_ptr),
+        routing_weights.data_ptr<float>(),
+        selected_experts.data_ptr<int32_t>(),
+        args->gate_up_qs_ptr,
+        static_cast<const at::Half*>(args->gate_up_d_ptr),
+        args->down_proj_qs_ptr,
+        static_cast<const at::Half*>(args->down_proj_d_ptr),
+        args->num_tokens,
+        args->hidden_dim,
+        args->num_experts,
+        args->intermediate_size,
+        args->intermediate_size_x2,
+        args->top_k
     );
 }
 
-// A helper struct to pass all our data through the void* userData of the CUDA callback.
-struct CpuMoeTaskData {
-    // ... (definition is the same)
-    torch::Tensor x;
-    torch::Tensor logits;
-    torch::Tensor gate_up_qs_stacked;
-    torch::Tensor gate_up_d_stacked;
-    torch::Tensor down_proj_qs_stacked;
-    torch::Tensor down_proj_d_stacked;
-    int top_k;
-    bool normalize;
-};
+// Step 3: Create the tiny callback function required by CUDA.
+// This function's only job is to unpack the data and call the real worker function.
+void CUDART_CB cpu_moe_callback_gil_free(void* userData) {
+    // This function is executed by a CUDA-managed CPU thread.
+    // It has NO access to the Python GIL.
+    MoEArgs* args = static_cast<MoEArgs*>(userData);
 
-// The actual function that will be executed by a CPU thread, managed by the CUDA driver.
-void CUDART_CB cpu_moe_callback(void* userData) {
-    // ... (implementation is the same)
-    auto* data = static_cast<CpuMoeTaskData*>(userData);
-    if (data->x.scalar_type() == torch::kFloat) {
-        gating_and_moe_forward_cpu_task<float>(
-            data->x, data->logits, data->gate_up_qs_stacked, data->gate_up_d_stacked,
-            data->down_proj_qs_stacked, data->down_proj_d_stacked, data->top_k, data->normalize);
-    } else if (data->x.scalar_type() == torch::kBFloat16) {
-        gating_and_moe_forward_cpu_task<at::BFloat16>(
-            data->x, data->logits, data->gate_up_qs_stacked, data->gate_up_d_stacked,
-            data->down_proj_qs_stacked, data->down_proj_d_stacked, data->top_k, data->normalize);
-    } else if (data->x.scalar_type() == torch::kHalf) {
-        gating_and_moe_forward_cpu_task<at::Half>(
-            data->x, data->logits, data->gate_up_qs_stacked, data->gate_up_d_stacked,
-            data->down_proj_qs_stacked, data->down_proj_d_stacked, data->top_k, data->normalize);
+    // Dispatch to the correct templated implementation based on the stored dtype
+    if (args->dtype == torch::kFloat) {
+        gating_and_moe_computation_gil_free<float>(args);
+    } else if (args->dtype == torch::kBFloat16) {
+        gating_and_moe_computation_gil_free<at::BFloat16>(args);
+    } else if (args->dtype == torch::kHalf) {
+        gating_and_moe_computation_gil_free<at::Half>(args);
     }
-    delete data;
+
+    // Free the memory that was allocated in the bridge function.
+    if (!args->keep_args) {
+        delete args;
+    }
 }
 
-// The Python-facing function that enqueues the host function call into the CUDA stream.
+// Step 4: Create the "bridge" function that is called from Python.
+// This function CAN hold the GIL and safely interact with torch::Tensor.
 void launch_gating_and_moe_cpu_task(
-    torch::Tensor x,
-    torch::Tensor logits,
+    torch::Tensor pinned_hidden, // This is both input and output
+    torch::Tensor pinned_logits,
     torch::Tensor gate_up_qs_stacked,
     torch::Tensor gate_up_d_stacked,
     torch::Tensor down_proj_qs_stacked,
     torch::Tensor down_proj_d_stacked,
     int top_k,
     bool normalize,
-    uintptr_t stream_ptr
+    intptr_t stream_ptr, // Pass stream as a pointer-sized integer
+    bool keep_args
 ) {
-    // ... (implementation is the same)
-    TORCH_CHECK(x.is_pinned(), "Input 'x' must be in pinned memory");
-    TORCH_CHECK(logits.is_pinned(), "Input 'logits' must be in pinned memory");
-    TORCH_CHECK(x.scalar_type() == logits.scalar_type(), "x and logits must have the same dtype");
+    // This function is called from Python and holds the GIL.
+    // It is safe to use torch::Tensor APIs here.
+
+    // --- Input validation ---
+    TORCH_CHECK(pinned_hidden.is_pinned(), "Input 'pinned_hidden' must be in pinned memory");
+    TORCH_CHECK(pinned_logits.is_pinned(), "Input 'pinned_logits' must be in pinned memory");
+    TORCH_CHECK(pinned_hidden.scalar_type() == pinned_logits.scalar_type(), "hidden and logits must have the same dtype");
     
-    auto supported_dtype = x.scalar_type() == torch::kFloat || 
-                           x.scalar_type() == torch::kBFloat16 || 
-                           x.scalar_type() == torch::kHalf;
+    const auto dtype = pinned_hidden.scalar_type();
+    const bool supported_dtype = dtype == torch::kFloat || dtype == torch::kBFloat16 || dtype == torch::kHalf;
     TORCH_CHECK(supported_dtype, "Unsupported dtype. Supported: float32, bfloat16, float16.");
 
-    auto* task_data = new CpuMoeTaskData{
-        x, logits, gate_up_qs_stacked, gate_up_d_stacked,
-        down_proj_qs_stacked, down_proj_d_stacked, top_k, normalize
-    };
-    cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
-    cudaError_t err = cudaLaunchHostFunc(stream, cpu_moe_callback, task_data);
-    TORCH_CHECK(err == cudaSuccess, "cudaLaunchHostFunc failed: ", cudaGetErrorString(err));
-}
+    // --- Create and populate the args struct ON THE HEAP ---
+    auto* args = new MoEArgs();
 
+    args->pinned_hidden_ptr = pinned_hidden.data_ptr();
+    args->pinned_logits_ptr = pinned_logits.data_ptr();
+    args->gate_up_qs_ptr = gate_up_qs_stacked.data_ptr<int8_t>();
+    args->gate_up_d_ptr = gate_up_d_stacked.data_ptr();
+    args->down_proj_qs_ptr = down_proj_qs_stacked.data_ptr<int8_t>();
+    args->down_proj_d_ptr = down_proj_d_stacked.data_ptr();
+
+    args->num_tokens = pinned_hidden.size(0);
+    args->hidden_dim = pinned_hidden.size(1);
+    args->num_experts = gate_up_qs_stacked.size(0);
+    args->intermediate_size_x2 = gate_up_qs_stacked.size(1);
+    args->intermediate_size = down_proj_qs_stacked.size(2);
+    
+    args->top_k = top_k;
+    args->normalize = normalize;
+    args->dtype = dtype;
+
+    args->keep_args = keep_args;
+    
+    // --- Enqueue the GIL-free callback into the CUDA stream ---
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+    cudaError_t err = cudaLaunchHostFunc(stream, cpu_moe_callback_gil_free, args);
+
+    if (err != cudaSuccess) {
+        // delete args; // Clean up memory if the launch fails.
+        TORCH_CHECK(false, "cudaLaunchHostFunc failed: ", cudaGetErrorString(err));
+    }
+}
 #endif // WITH_CUDA
 
-
 // ==========================================================================================
-// PYBIND11 MODULE DEFINITION - NOW CLEANED UP
+// PYBIND11 MODULE DEFINITION - NOW CORRECT
 // ==========================================================================================
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    // These functions are for standard CPU execution and testing. They are unchanged.
     m.def("quantize_repack_weight", &quantize_repack_weight, "Quantize and repack weight for q8_gemm");
     m.def("q8_gemm", &q8_gemm, "q8_gemm kernel (A_fp32 @ B_q8.T)");
     m.def("moe_q8_forward", &moe_q8_forward, "Full MoE expert forward pass with int8 GEMM on CPU for float, bfloat16, and float16 inputs");
     m.def("gating_top_k_softmax", &gating_top_k_softmax, "Perform Top-K and Softmax on CPU for MoE gating, returning new tensors");
 
-    // Add the new function to the pybind module, protected by the same preprocessor guard.
+    // Add the new CUDA-integrated function, protected by the preprocessor guard.
     #ifdef WITH_CUDA
-    m.def("launch_gating_and_moe_cpu_task", &launch_gating_and_moe_cpu_task, "Launches the combined MoE CPU computation in a CUDA stream.");
+    m.def(
+        "launch_gating_and_moe_cpu_task",
+        &launch_gating_and_moe_cpu_task,
+        "Launches the combined gating and MoE CPU computation task into a CUDA stream (GIL-free)."
+    );
     #endif
 }

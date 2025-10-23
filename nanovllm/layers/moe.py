@@ -95,6 +95,7 @@ class SparseMoeBlock(nn.Module):
         # --- Phase 2: Enqueue CPU Computation into the CUDA stream ---
         stream = torch.cuda.current_stream().cuda_stream
 
+        keep_args = not ctx.is_prefill and ctx.is_graph_captured
         nanovllm_ext.launch_gating_and_moe_cpu_task(
             pinned_hidden,           # The buffer to be modified in-place
             pinned_logits,           # Input for gating
@@ -104,7 +105,8 @@ class SparseMoeBlock(nn.Module):
             self.down_proj_d_stacked,
             self.top_k,              # Gating parameters...
             self.norm_top_k_prob,
-            stream                   # The CUDA stream to enqueue the task into
+            stream,                  # The CUDA stream to enqueue the task into
+            keep_args        # Whether to keep the arguments alive (for graph mode)
         )
 
         # Asynchronously copy the final result back to the GPU.

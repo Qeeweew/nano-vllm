@@ -111,6 +111,7 @@ class OlmoeDecoderLayer(nn.Module):
         super().__init__()
         self.self_attn = OlmoeAttention(config)
         self.mlp = SparseMoeBlock(
+            layer_idx=-1,
             hidden_size=config.hidden_size,
             num_experts=config.num_experts,
             top_k=config.num_experts_per_tok,
