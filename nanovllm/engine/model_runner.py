@@ -243,7 +243,7 @@ class ModelRunner:
             "moe_tracker": self.moe_tracker
         }
         # If in graph mode (not eager), pass the static pinned buffers to the context.
-        if not self.enforce_eager:
+        if input_ids.size(0) <= self.config.max_capture_batch_size and not self.enforce_eager:
             context_kwargs["is_graph_captured"] = True
             context_kwargs["graph_moe_hidden_buffer"] = self.graph_vars["moe_hidden_buffer"]
             context_kwargs["graph_moe_logits_buffer"] = self.graph_vars["moe_logits_buffer"]
@@ -261,7 +261,7 @@ class ModelRunner:
 
     @torch.inference_mode()
     def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool):
-        if is_prefill or self.enforce_eager or input_ids.size(0) > 512:
+        if is_prefill or self.enforce_eager or input_ids.size(0) > self.config.max_capture_batch_size:
             # Eager mode execution
             return self.model.compute_logits(self.model(input_ids, positions))
         else:
@@ -294,7 +294,7 @@ class ModelRunner:
     def capture_cudagraph(self):
         config = self.config
         hf_config = config.hf_config
-        max_bs = min(self.config.max_num_seqs, 512)
+        max_bs = min(self.config.max_capture_batch_size, self.config.max_num_seqs)
         max_num_blocks = (config.max_model_len + self.block_size - 1) // self.block_size
         
         # --- Standard graph variable allocation (unchanged) ---
@@ -318,7 +318,7 @@ class ModelRunner:
             dtype=hf_config.torch_dtype, device="cpu", pin_memory=True
         )
 
-        self.graph_bs = [1, 2, 3, 4, 5, 6, 7, 8] + list(range(16, max_bs + 1, 16))
+        self.graph_bs = list(range(1, max_bs + 1))
         self.graphs = {}
         self.graph_pool = None
 
