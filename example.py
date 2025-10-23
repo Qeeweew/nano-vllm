@@ -6,22 +6,24 @@ from transformers import AutoTokenizer
 
 
 def main():
-    path = os.path.expanduser("/home/xwj/workspace/models/Qwen3-30B-A3B-quantized")
-    # tokenizer = AutoTokenizer.from_pretrained(path)
+    path = os.path.expanduser("/home/xwj/workspace/models/Qwen3-30B-A3B-quantized/")
+    tokenizer = AutoTokenizer.from_pretrained(path)
     llm = LLM(path, enforce_eager=False, tensor_parallel_size=1)
 
     sampling_params = SamplingParams(temperature=0, max_tokens=128)
     prompts = [
-        "Bitcoin is"
+        "What is Bitcoin?",
+        "Explain the theory of relativity in simple terms.",
+        "Write a Python function to compute the Fibonacci sequence.",
     ]
-    # prompts = [
-    #     tokenizer.apply_chat_template(
-    #         [{"role": "user", "content": prompt}],
-    #         tokenize=False,
-    #         add_generation_prompt=True,
-    #     )
-    #     for prompt in prompts
-    # ]
+    prompts = [
+        tokenizer.apply_chat_template(
+            [{"role": "user", "content": prompt}],
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+        for prompt in prompts
+    ]
     print("Warm-up run...")
     _ = llm.generate(["test: "], SamplingParams(temperature=0, max_tokens=1))
 

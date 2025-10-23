@@ -22,9 +22,9 @@ def benchmark(llm: LLM, batch_size: int, input_len: int = 1, output_len: int = 1
 
 def main():
     seed(0)
-    path = os.path.expanduser("~/workspace/models/Qwen3-30B-A3B/")
+    path = os.path.expanduser("~/workspace/models/Qwen3-30B-A3B-quantized/")
     # enforce_eager = True to disable cuda graph
-    llm = LLM(path, enforce_eager=True, max_model_len=4096)
+    llm = LLM(path, enforce_eager=False, max_model_len=4096)
 
     print("Benchmarking Decoding Throughput...")
     for batch_size in [1, 2, 4, 8, 16, 32, 64, 128]:

@@ -10,14 +10,14 @@ setup(
     ext_modules=[
         CUDAExtension(
             'nanovllm_ext',
-            ['q8_gemm.cpp'],  # Keep the .cpp extension
-            
-            # --- ADD THIS LINE ---
+            [
+                'q8_gemm.cpp',
+                'moe_infer.cpp'  # <-- ADD THIS NEW FILE
+            ],
             define_macros=[('WITH_CUDA', None)],
-
             extra_compile_args={
                 'cxx': ['-O3', '-ffast-math', '-Wall', '-march=native', '-fopenmp'],
-                'nvcc': ['-O3', '--use_fast_math'] 
+                'nvcc': ['-O3', '--use_fast_math']
             },
             extra_link_args=['-fopenmp'],
         ),

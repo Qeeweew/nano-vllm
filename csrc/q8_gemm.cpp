@@ -11,6 +11,7 @@
 #include "utils.h"
 #include "vec_simd.h"
 #include <omp.h>
+#include "moe_infer.h"
 
 #if defined(__ARM_NEON)
 #include <arm_neon.h>
@@ -44,6 +45,9 @@ typedef struct {
 #elif defined(__AVX2__)
 #define MR 8
 #define NR 8
+#if defined (__AVXVNNI__)
+#define _mm256_dpbusd_epi32 _mm256_dpbusd_avx_epi32
+#endif
 #endif
 
 template<typename D_TYPE>
@@ -279,7 +283,7 @@ static void gemm_q8_0_microkernel_specialized(
         __m256i sum[MR];
         for (int i = 0; i < MR_T; ++i) sum[i] = _mm256_setzero_si256();
 
-#if defined(__AVXVNNI__)
+#if defined(__AVXVNNI__) || defined(__AVX512VNNI__)
         __m256i sum_a_vec = _mm256_setzero_si256();
 
         for (int k = 0; k < QK8_0; k += 4) {
@@ -287,11 +291,11 @@ static void gemm_q8_0_microkernel_specialized(
             b_vec = _mm256_sub_epi8(b_vec, _mm256_set1_epi8(-128)); // b_vec + 128
             b_ptr += NR * 4;
             __m256i a_vec = _mm256_load_si256((__m256i const*)a_ptr);
-            sum_a_vec = _mm256_dpbusd_avx_epi32(sum_a_vec, _mm256_set1_epi8(1), a_vec);
+            sum_a_vec = _mm256_dpbusd_epi32(sum_a_vec, _mm256_set1_epi8(1), a_vec);
 
             for (int i = 0; i < MR_T; ++i) {
                 __m256i a_vec = _mm256_set1_epi32(*((int*)(a_ptr + i * 4)));
-                sum[i] = _mm256_dpbusd_avx_epi32(sum[i], b_vec, a_vec);
+                sum[i] = _mm256_dpbusd_epi32(sum[i], b_vec, a_vec);
             }
             a_ptr += MR * 4; // Move to next set of A data
         }
@@ -1122,9 +1126,9 @@ inline float fast_exp(float x)
 template <typename T>
 void gating_top_k_softmax_ptr_impl(
     const T* logits_ptr,
-    int num_tokens,
-    int num_experts,
-    int top_k,
+    int64_t num_tokens,
+    int64_t num_experts,
+    int64_t top_k,
     bool normalize,
     float* routing_weights_out_ptr, // Output pointer
     int32_t* selected_experts_out_ptr  // Output pointer
@@ -1190,7 +1194,7 @@ void gating_top_k_softmax_ptr_impl(
 template <typename T>
 void gating_top_k_softmax_impl(
     const torch::Tensor& logits,
-    int top_k,
+    int64_t top_k,
     bool normalize,
     torch::Tensor& routing_weights_out,
     torch::Tensor& selected_experts_out
@@ -1232,158 +1236,143 @@ std::vector<torch::Tensor> gating_top_k_softmax(
     return {routing_weights_out, selected_experts_out};
 }
 
+template void gating_top_k_softmax_ptr_impl<float>(
+    const float* logits_ptr,
+    int64_t num_tokens,
+    int64_t num_experts,
+    int64_t top_k,
+    bool normalize,
+    float* routing_weights_out_ptr,
+    int32_t* selected_experts_out_ptr
+);
+
+template void gating_top_k_softmax_ptr_impl<at::Half>(
+    const at::Half* logits_ptr,
+    int64_t num_tokens,
+    int64_t num_experts,
+    int64_t top_k,
+    bool normalize,
+    float* routing_weights_out_ptr,
+    int32_t* selected_experts_out_ptr
+);
+
+template void gating_top_k_softmax_ptr_impl<at::BFloat16>(
+    const at::BFloat16* logits_ptr,
+    int64_t num_tokens,
+    int64_t num_experts,
+    int64_t top_k,
+    bool normalize,
+    float* routing_weights_out_ptr,
+    int32_t* selected_experts_out_ptr
+);
+
+template void moe_q8_forward_ptr_impl<float>(
+    float* x_ptr,
+    const float* routing_weights_ptr,
+    const int32_t* selected_experts_ptr,
+    const int8_t* gate_up_qs_stacked_ptr,
+    const at::Half* gate_up_d_stacked_ptr,
+    const int8_t* down_proj_qs_stacked_ptr,
+    const at::Half* down_proj_d_stacked_ptr,
+    int64_t num_tokens,
+    int64_t hidden_dim,
+    int64_t num_experts,
+    int64_t intermediate_size,
+    int64_t intermediate_size_x2,
+    int64_t top_k
+);
+
+template void moe_q8_forward_ptr_impl<at::Half>(
+    at::Half* x_ptr,
+    const float* routing_weights_ptr,
+    const int32_t* selected_experts_ptr,
+    const int8_t* gate_up_qs_stacked_ptr,
+    const at::Half* gate_up_d_stacked_ptr,
+    const int8_t* down_proj_qs_stacked_ptr,
+    const at::Half* down_proj_d_stacked_ptr,
+    int64_t num_tokens,
+    int64_t hidden_dim,
+    int64_t num_experts,
+    int64_t intermediate_size,
+    int64_t intermediate_size_x2,
+    int64_t top_k
+);
+
+template void moe_q8_forward_ptr_impl<at::BFloat16>(
+    at::BFloat16* x_ptr,
+    const float* routing_weights_ptr,
+    const int32_t* selected_experts_ptr,
+    const int8_t* gate_up_qs_stacked_ptr,
+    const at::Half* gate_up_d_stacked_ptr,
+    const int8_t* down_proj_qs_stacked_ptr,
+    const at::Half* down_proj_d_stacked_ptr,
+    int64_t num_tokens,
+    int64_t hidden_dim,
+    int64_t num_experts,
+    int64_t intermediate_size,
+    int64_t intermediate_size_x2,
+    int64_t top_k
+);
+
 #ifdef WITH_CUDA
 #include <cuda_runtime.h> // For cudaLaunchHostFunc
 
-// Step 1: Define a struct to hold raw data. NO py::object or torch::Tensor here.
-// This is the data packet that will be passed from the GIL-holding world
-// to the GIL-free world.
-struct MoEArgs {
-    // Pointers to the data buffers (all reside in pinned CPU memory)
-    void*           pinned_hidden_ptr;
-    void*           pinned_logits_ptr;
-
-    // Pointers to expert weights (reside in standard CPU memory)
-    const int8_t*   gate_up_qs_ptr;
-    const void*     gate_up_d_ptr; // Can be at::Half
-    const int8_t*   down_proj_qs_ptr;
-    const void*     down_proj_d_ptr; // Can be at::Half
-
-    // Dimensions
+struct MoECpuTaskArgs {
+    void* hidden_states_ptr;
+    const void* router_logits_ptr;
     int64_t num_tokens;
-    int64_t hidden_dim;
-    int64_t num_experts;
-    int64_t intermediate_size;
-    int64_t intermediate_size_x2;
-
-    // Configuration
-    int top_k;
-    bool normalize;
-
-    // Metadata needed to correctly interpret the void* pointers
+    int64_t top_k;
+    bool normalize_prob;
+    MoEInfer* moe_infer_ptr;
+    bool keep_args;
     at::ScalarType dtype;
-
-    bool keep_args; // Whether to keep the args struct after execution
 };
 
-// Step 2: Create the GIL-free computation function.
-// This function contains the core logic but operates only on raw pointers and primitive types.
-template <typename T>
-void gating_and_moe_computation_gil_free(MoEArgs* args) {
-    // --- Part A: Gating using raw pointers ---
-    // Allocate temporary local tensors for the gating outputs. This is safe and self-contained.
-    auto routing_weights = torch::empty({args->num_tokens, args->top_k}, torch::kFloat);
-    auto selected_experts = torch::empty({args->num_tokens, args->top_k}, torch::kInt32);
-
-    // Call the pointer-based gating implementation directly. NO from_blob needed.
-    gating_top_k_softmax_ptr_impl<T>(
-        static_cast<const T*>(args->pinned_logits_ptr),
+// The callback function remains simple.
+void CUDART_CB host_fn_callback(void* user_data) {
+    auto* args = static_cast<MoECpuTaskArgs*>(user_data);
+    
+    args->moe_infer_ptr->execute_on_cpu_from_pointers(
+        args->hidden_states_ptr,
+        args->router_logits_ptr,
         args->num_tokens,
-        args->num_experts,
         args->top_k,
-        args->normalize,
-        routing_weights.data_ptr<float>(),
-        selected_experts.data_ptr<int32_t>()
+        args->normalize_prob,
+        args->dtype
     );
 
-    // --- Part B: MoE forward using raw pointers ---
-    // Call the pointer-based MoE implementation directly. NO from_blob needed.
-    // The result is written in-place into the `pinned_hidden_ptr` buffer.
-    moe_q8_forward_ptr_impl<T>(
-        static_cast<T*>(args->pinned_hidden_ptr),
-        routing_weights.data_ptr<float>(),
-        selected_experts.data_ptr<int32_t>(),
-        args->gate_up_qs_ptr,
-        static_cast<const at::Half*>(args->gate_up_d_ptr),
-        args->down_proj_qs_ptr,
-        static_cast<const at::Half*>(args->down_proj_d_ptr),
-        args->num_tokens,
-        args->hidden_dim,
-        args->num_experts,
-        args->intermediate_size,
-        args->intermediate_size_x2,
-        args->top_k
-    );
-}
-
-// Step 3: Create the tiny callback function required by CUDA.
-// This function's only job is to unpack the data and call the real worker function.
-void CUDART_CB cpu_moe_callback_gil_free(void* userData) {
-    // This function is executed by a CUDA-managed CPU thread.
-    // It has NO access to the Python GIL.
-    MoEArgs* args = static_cast<MoEArgs*>(userData);
-
-    // Dispatch to the correct templated implementation based on the stored dtype
-    if (args->dtype == torch::kFloat) {
-        gating_and_moe_computation_gil_free<float>(args);
-    } else if (args->dtype == torch::kBFloat16) {
-        gating_and_moe_computation_gil_free<at::BFloat16>(args);
-    } else if (args->dtype == torch::kHalf) {
-        gating_and_moe_computation_gil_free<at::Half>(args);
-    }
-
-    // Free the memory that was allocated in the bridge function.
     if (!args->keep_args) {
         delete args;
     }
 }
 
-// Step 4: Create the "bridge" function that is called from Python.
-// This function CAN hold the GIL and safely interact with torch::Tensor.
-void launch_gating_and_moe_cpu_task(
-    torch::Tensor pinned_hidden, // This is both input and output
-    torch::Tensor pinned_logits,
-    torch::Tensor gate_up_qs_stacked,
-    torch::Tensor gate_up_d_stacked,
-    torch::Tensor down_proj_qs_stacked,
-    torch::Tensor down_proj_d_stacked,
-    int top_k,
-    bool normalize,
-    intptr_t stream_ptr, // Pass stream as a pointer-sized integer
+// The launch function is where we interact with PyTorch tensors and extract raw data.
+// This function MUST be called while holding the GIL.
+void launch_moe_cpu_task(
+    torch::Tensor& hidden_states_pinned,
+    const torch::Tensor& router_logits_pinned,
+    py::capsule& moe_infer_handle,
+    int64_t top_k,
+    bool normalize_prob,
+    uint64_t stream_ptr,
     bool keep_args
 ) {
-    // This function is called from Python and holds the GIL.
-    // It is safe to use torch::Tensor APIs here.
+    TORCH_CHECK(hidden_states_pinned.is_pinned(), "hidden_states must be a pinned tensor");
+    TORCH_CHECK(router_logits_pinned.is_pinned(), "router_logits must be a pinned tensor");
+    TORCH_CHECK(hidden_states_pinned.scalar_type() == router_logits_pinned.scalar_type(), "Dtype mismatch between hidden_states and router_logits");
 
-    // --- Input validation ---
-    TORCH_CHECK(pinned_hidden.is_pinned(), "Input 'pinned_hidden' must be in pinned memory");
-    TORCH_CHECK(pinned_logits.is_pinned(), "Input 'pinned_logits' must be in pinned memory");
-    TORCH_CHECK(pinned_hidden.scalar_type() == pinned_logits.scalar_type(), "hidden and logits must have the same dtype");
+    auto* args = new MoECpuTaskArgs{
+        hidden_states_pinned.data_ptr(),
+        router_logits_pinned.data_ptr(),
+        hidden_states_pinned.size(0), // num_tokens
+        top_k,
+        normalize_prob,
+        moe_infer_handle.get_pointer<MoEInfer>(),
+        keep_args,
+        hidden_states_pinned.scalar_type()
+    };
     
-    const auto dtype = pinned_hidden.scalar_type();
-    const bool supported_dtype = dtype == torch::kFloat || dtype == torch::kBFloat16 || dtype == torch::kHalf;
-    TORCH_CHECK(supported_dtype, "Unsupported dtype. Supported: float32, bfloat16, float16.");
-
-    // --- Create and populate the args struct ON THE HEAP ---
-    auto* args = new MoEArgs();
-
-    args->pinned_hidden_ptr = pinned_hidden.data_ptr();
-    args->pinned_logits_ptr = pinned_logits.data_ptr();
-    args->gate_up_qs_ptr = gate_up_qs_stacked.data_ptr<int8_t>();
-    args->gate_up_d_ptr = gate_up_d_stacked.data_ptr();
-    args->down_proj_qs_ptr = down_proj_qs_stacked.data_ptr<int8_t>();
-    args->down_proj_d_ptr = down_proj_d_stacked.data_ptr();
-
-    args->num_tokens = pinned_hidden.size(0);
-    args->hidden_dim = pinned_hidden.size(1);
-    args->num_experts = gate_up_qs_stacked.size(0);
-    args->intermediate_size_x2 = gate_up_qs_stacked.size(1);
-    args->intermediate_size = down_proj_qs_stacked.size(2);
-    
-    args->top_k = top_k;
-    args->normalize = normalize;
-    args->dtype = dtype;
-
-    args->keep_args = keep_args;
-    
-    // --- Enqueue the GIL-free callback into the CUDA stream ---
-    cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
-    cudaError_t err = cudaLaunchHostFunc(stream, cpu_moe_callback_gil_free, args);
-
-    if (err != cudaSuccess) {
-        // delete args; // Clean up memory if the launch fails.
-        TORCH_CHECK(false, "cudaLaunchHostFunc failed: ", cudaGetErrorString(err));
-    }
+    cudaLaunchHostFunc(reinterpret_cast<cudaStream_t>(stream_ptr), host_fn_callback, args);
 }
 #endif // WITH_CUDA
 
@@ -1397,13 +1386,18 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("q8_gemm", &q8_gemm, "q8_gemm kernel (A_fp32 @ B_q8.T)");
     m.def("moe_q8_forward", &moe_q8_forward, "Full MoE expert forward pass with int8 GEMM on CPU for float, bfloat16, and float16 inputs");
     m.def("gating_top_k_softmax", &gating_top_k_softmax, "Perform Top-K and Softmax on CPU for MoE gating, returning new tensors");
-
     // Add the new CUDA-integrated function, protected by the preprocessor guard.
-    #ifdef WITH_CUDA
-    m.def(
-        "launch_gating_and_moe_cpu_task",
-        &launch_gating_and_moe_cpu_task,
-        "Launches the combined gating and MoE CPU computation task into a CUDA stream (GIL-free)."
-    );
-    #endif
+    m.def("create_moe_infer_handle", [](int64_t num_experts, int64_t hidden_size, int64_t intermediate_size) {
+        auto* ptr = new MoEInfer(num_experts, hidden_size, intermediate_size);
+        return py::capsule(ptr, [](void* p) { delete reinterpret_cast<MoEInfer*>(p); });
+    });
+    m.def("moe_infer_quantize_and_store", [](py::capsule& handle, int64_t expert_idx, const std::string& proj_name, const torch::Tensor& weight) {
+        handle.get_pointer<MoEInfer>()->quantize_and_store_expert(expert_idx, proj_name, weight);
+    });
+    m.def("moe_infer_store_quantized", [](py::capsule& handle, const torch::Tensor& gate_up_qs, const torch::Tensor& gate_up_d, const torch::Tensor& down_proj_qs, const torch::Tensor& down_proj_d) {
+        handle.get_pointer<MoEInfer>()->store_quantized_weights(gate_up_qs, gate_up_d, down_proj_qs, down_proj_d);
+    });
+#ifdef WITH_CUDA
+    m.def("launch_moe_cpu_task", &launch_moe_cpu_task, "Launches the GIL-free MoE CPU task via cudaLaunchHostFunc.");
+#endif
 }
