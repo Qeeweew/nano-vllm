@@ -14,12 +14,12 @@ setup(
                 'q8_gemm.cpp',
                 'moe_infer.cpp'  # <-- ADD THIS NEW FILE
             ],
-            define_macros=[('WITH_CUDA', None)],
+            define_macros=[('WITH_CUDA', None), ('WITH_NUMA', None)],
             extra_compile_args={
                 'cxx': ['-O3', '-ffast-math', '-Wall', '-march=native', '-fopenmp'],
                 'nvcc': ['-O3', '--use_fast_math']
             },
-            extra_link_args=['-fopenmp'],
+            extra_link_args=['-fopenmp', '-lnuma'],
         ),
     ],
     cmdclass={

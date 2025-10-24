@@ -23,21 +23,7 @@
 
 #define QK8_0 32
 
-// FP16 related definitions from gemm_q8_0.h
-#if defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC)
-    using ggml_half = __fp16;
-    #define GGML_CPU_FP32_TO_FP16(x) ((__fp16)(x))
-    #define GGML_CPU_FP16_TO_FP32(x) ((float)(x))
-#elif defined(__F16C__)
-    using ggml_half = uint16_t;
-    #define GGML_CPU_FP32_TO_FP16(x) _cvtss_sh(x, 0)
-    #define GGML_CPU_FP16_TO_FP32(x) _cvtsh_ss(x)
-#endif
-
-typedef struct {
-    ggml_half d;
-    int8_t  qs[QK8_0];
-} block_q8_0;
+using ggml_half = at::Half;
 
 #if defined(__ARM_NEON)
 #define MR 8
@@ -127,49 +113,8 @@ static inline void quantize_block_q8_0(const float *x, D_TYPE* y_d, int8_t* y_qs
     i0 = _mm256_permutevar8x32_epi32( i0, perm );
     _mm256_storeu_si256(reinterpret_cast<__m256i*>(y_qs), i0);
 #endif
-    if constexpr(std::is_same_v<D_TYPE, float>) {
-        *y_d = d;
-    } else {
-        *y_d = GGML_CPU_FP32_TO_FP16(d);
-    }
+    *y_d = d;
 }
-
-static void quantize_row_q8_0(const float * x, void * vy, int64_t k) {
-    assert(k % QK8_0 == 0);
-    const int nb = k / QK8_0;
-    block_q8_0 * y = (block_q8_0 *)vy;
-    for (int i = 0; i < nb; i++) {
-        quantize_block_q8_0(x + i * QK8_0, &y[i].d, y[i].qs);
-    }
-}
-
-static void pack_B_q8_0(
-    int N, int K, const block_q8_0* B_q, int ldb_q,
-    int8_t* B_qs_packed, ggml_half* B_d_packed)
-{
-   const int K_BLOCKS = K / QK8_0;
-    for (int j = 0; j < N; j += NR) {
-        for(int k_block = 0; k_block < K_BLOCKS; ++k_block) {
-            for (int col = 0; col < NR; ++col) {
-                if (j + col < N) {
-                    *B_d_packed++ = (B_q + (j + col) * ldb_q + k_block)->d;
-                }
-            }
-        }
-
-        for(int k_block = 0; k_block < K_BLOCKS; ++k_block) {
-            for (int k_rem = 0; k_rem < QK8_0; k_rem += 4) {
-                for (int col = 0; col < NR; ++col) {
-                    if (j + col < N) {
-                        memcpy(B_qs_packed, (B_q + (j + col) * ldb_q + k_block)->qs + k_rem, 4);
-                    }
-                    B_qs_packed += 4;
-                }
-            }
-        }
-    }
-}
-
 
 // Template specialized microkernel implementation
 template <int MR_T, typename B_SCALE_TYPE>
@@ -480,35 +425,88 @@ void gemm_q8_0_aten_parallel_packed(int M, int N, int K, const float* A, int lda
 // PYTORCH BINDINGS
 // ==========================================================================================
 
-std::vector<torch::Tensor> quantize_repack_weight(torch::Tensor B_float) {
+template<typename D_TYPE>
+static void quantize_row_q8_0_no_repack(
+    const float * src,
+    int8_t* dest_qs,
+    D_TYPE* dest_d,
+    int64_t K
+) {
+    const int64_t k_blocks = K / QK8_0;
+    for (int i = 0; i < k_blocks; ++i) {
+        quantize_block_q8_0(src + i * QK8_0, &dest_d[i], dest_qs + i * QK8_0);
+    }
+}
+
+// New, CORRECT implementation of the repack function that mimics pack_B_q8_0.
+template<typename D_TYPE>
+void repack_B_q8_0_from_ptr(
+    int64_t N, int64_t K,
+    const int8_t* src_qs, const D_TYPE* src_d,
+    int8_t* dest_qs_packed, D_TYPE* dest_d_packed
+) {
+    const int K_BLOCKS = K / QK8_0;
+
+    for (int j = 0; j < N; j += NR) {
+        // First, pack all the scales for the next NR rows
+        for(int k_block = 0; k_block < K_BLOCKS; ++k_block) {
+            for (int col = 0; col < NR; ++col) {
+                if (j + col < N) {
+                    *dest_d_packed = src_d[(j + col) * K_BLOCKS + k_block];
+                }
+                dest_d_packed++;
+            }
+        }
+
+        // Then, pack all the quants for the next NR rows with interleaving
+        for(int k_block = 0; k_block < K_BLOCKS; ++k_block) {
+            // Interleave in chunks of 4 bytes, which is a common SIMD optimization
+            for (int k_rem = 0; k_rem < QK8_0; k_rem += 4) {
+                for (int col = 0; col < NR; ++col) {
+                    if (j + col < N) {
+                        const int8_t* src_ptr = src_qs + (j + col) * K + k_block * QK8_0 + k_rem;
+                        memcpy(dest_qs_packed, src_ptr, 4);
+                    }
+                    dest_qs_packed += 4;
+                }
+            }
+        }
+    }
+}
+
+template void repack_B_q8_0_from_ptr<at::Half>(
+    int64_t N, int64_t K,
+    const int8_t* src_qs, const at::Half* src_d,
+    int8_t* dest_qs_packed, at::Half* dest_d_packed
+);
+
+
+std::vector<torch::Tensor> quantize_weight_only(torch::Tensor B_float) {
     TORCH_CHECK(B_float.dim() == 2, "Weight must be 2D");
     TORCH_CHECK(B_float.is_contiguous(), "Weight must be contiguous");
     TORCH_CHECK(B_float.device().is_cpu(), "Weight must be on CPU");
     
     const auto N = B_float.size(0);
     const auto K = B_float.size(1);
-    // printf("N = %d K = %d\n", N, K);
     
     TORCH_CHECK(K % QK8_0 == 0, "Weight's K dimension must be a multiple of ", QK8_0);
 
     const int K_BLOCKS = K / QK8_0;
-    std::vector<block_q8_0> B_q(N * K_BLOCKS);
-    
+    auto B_qs_tensor = torch::empty({N, K}, torch::kInt8);
+    auto B_d_tensor = torch::empty({N, K_BLOCKS}, torch::kHalf);
+
     at::parallel_for(0, N, 0, [&](int64_t start, int64_t end) {
         for (int64_t j = start; j < end; ++j) {
-            quantize_row_q8_0(B_float.data_ptr<float>() + j * K, B_q.data() + j * K_BLOCKS, K);
+            quantize_row_q8_0_no_repack(
+                B_float.data_ptr<float>() + j * K,
+                B_qs_tensor.data_ptr<int8_t>() + j * K,
+                B_d_tensor.data_ptr<at::Half>() + j * K_BLOCKS,
+                K
+            );
         }
     });
 
-    auto B_qs_packed_tensor = torch::empty({N, K}, torch::kInt8);
-    auto B_d_packed_tensor = torch::empty({N, K_BLOCKS}, torch::kHalf);
-    
-    int8_t* B_qs_packed_ptr = B_qs_packed_tensor.data_ptr<int8_t>();
-    ggml_half* B_d_packed_ptr = reinterpret_cast<ggml_half*>(B_d_packed_tensor.data_ptr<at::Half>());
-
-    pack_B_q8_0(N, K, B_q.data(), K_BLOCKS, B_qs_packed_ptr, B_d_packed_ptr);
-
-    return {B_qs_packed_tensor, B_d_packed_tensor};
+    return {B_qs_tensor, B_d_tensor};
 }
 
 torch::Tensor q8_gemm(
@@ -1043,6 +1041,225 @@ void moe_q8_forward_ptr_impl(
     std::free(expert_intermediate2);
 }
 
+// =================================================================================================
+// NUMA-AWARE TENSOR PARALLEL IMPLEMENTATION for MoE
+// =================================================================================================
+template <typename T>
+void moe_q8_forward_ptr_numa_impl(
+    T* x_ptr, // Input/Output, must be float for this implementation
+    const float* routing_weights_ptr,
+    const int32_t* selected_experts_ptr,
+    const std::vector<void*>& gate_up_qs_stacked_numa,
+    const std::vector<void*>& gate_up_d_stacked_numa,
+    const std::vector<void*>& down_proj_qs_stacked_numa,
+    const std::vector<void*>& down_proj_d_stacked_numa,
+    int64_t num_tokens, int64_t hidden_dim, int64_t num_experts,
+    int64_t intermediate_size, // Full intermediate size
+    int64_t top_k,
+    int numa_nodes // Number of NUMA nodes used for partitioning
+) {
+    // =======================================================================
+    // 1. PREPROCESSING & GATHER/SCATTER MAP CREATION
+    // =======================================================================
+    const int64_t hidden_dim_k_blocks = hidden_dim / QK8_0;
+    const int64_t intermediate_size_per_node = intermediate_size / numa_nodes;
+    const int64_t intermediate_size_x2_per_node = intermediate_size_per_node * 2;
+    
+    TORCH_CHECK(intermediate_size % numa_nodes == 0, "Intermediate size must be divisible by the number of NUMA nodes.");
+
+    std::vector<int> expert_counts(num_experts, 0);
+    std::vector<int> expert_starts(num_experts + 1, 0);
+    std::vector<MoETokenInfo> token_map;
+    std::vector<int32_t> scatter_map;
+
+    preprocess_moe_routing(
+        num_experts, top_k, num_tokens, selected_experts_ptr,
+        expert_counts, expert_starts, token_map, scatter_map
+    );
+
+    const int total_expert_tokens = expert_starts[num_experts];
+    if (total_expert_tokens == 0) {
+        memset(x_ptr, 0, num_tokens * hidden_dim * sizeof(T));
+        return;
+    }
+
+    // Create task list (same as before)
+    constexpr int M_BLOCK = 32;
+    struct MoeTask { int expert_id, num_tokens, global_token_start_pos; };
+    std::vector<MoeTask> tasks;
+    tasks.reserve(total_expert_tokens / M_BLOCK + num_experts);
+    for (int exp_id = 0; exp_id < num_experts; ++exp_id) {
+        const int count = expert_counts[exp_id];
+        if (count == 0) continue;
+        const int start_pos = expert_starts[exp_id];
+        for (int offset = 0; offset < count; offset += M_BLOCK) {
+            tasks.push_back({exp_id, std::min(M_BLOCK, count - offset), start_pos + offset});
+        }
+    }
+    const int task_count = static_cast<int>(tasks.size());
+
+    // =======================================================================
+    // 2. ALLOCATE BUFFERS
+    // =======================================================================
+    int8_t* x_qs = static_cast<int8_t*>(std::aligned_alloc(64, num_tokens * hidden_dim * sizeof(int8_t)));
+    float* x_d = static_cast<float*>(std::aligned_alloc(64, num_tokens * hidden_dim_k_blocks * sizeof(float)));
+
+    // Allocate per-NUMA output buffers for partial results
+    std::vector<float*> expert_intermediate2_numa(numa_nodes);
+    for (int i = 0; i < numa_nodes; ++i) {
+        size_t buffer_size = total_expert_tokens * hidden_dim * sizeof(float);
+#ifdef WITH_NUMA
+        if (numa_nodes > 1) {
+            expert_intermediate2_numa[i] = static_cast<float*>(numa_alloc_onnode(buffer_size, i));
+        } else {
+            expert_intermediate2_numa[i] = static_cast<float*>(std::aligned_alloc(64, buffer_size));
+        }
+#else
+        expert_intermediate2_numa[i] = static_cast<float*>(std::aligned_alloc(64, buffer_size));
+#endif
+        TORCH_CHECK(expert_intermediate2_numa[i] != nullptr, "Failed to allocate intermediate buffer on NUMA node ", i);
+    }
+    float* final_expert_intermediate = static_cast<float*>(std::aligned_alloc(64, total_expert_tokens * hidden_dim * sizeof(float)));
+    
+    const int omp_max_threads = omp_get_max_threads();
+
+    TORCH_CHECK(omp_max_threads % numa_nodes == 0, "Number of OpenMP threads must be divisible by the number of NUMA nodes.");
+
+    // =======================================================================
+    // 3. MAIN PARALLEL REGION (Quantize -> Compute -> AllReduce -> Scatter)
+    // =======================================================================
+    #pragma omp parallel num_threads(omp_max_threads)
+    {
+        // Get thread-local workspace
+        ws.ensure_size(M_BLOCK, hidden_dim, intermediate_size_per_node, intermediate_size_x2_per_node);
+
+        // --- A. THREAD BINDING ---
+        const int thread_id = omp_get_thread_num();
+        const int node_id = thread_id % numa_nodes;
+#ifdef WITH_NUMA
+        if (numa_nodes > 1) {
+            numa_run_on_node(node_id);
+            numa_set_preferred(node_id);
+        }
+#endif
+
+        // --- B. QUANTIZE ACTIVATIONS (Parallel) ---
+        #pragma omp for
+        for (int64_t i = 0; i < num_tokens; ++i) {
+            const T* src_row = x_ptr + i * hidden_dim; // Use raw pointer
+            for (int j = 0; j < hidden_dim; ++j) {
+                ws.temp_row_buffer[j] = static_cast<float>(src_row[j]);
+            }
+            for (int k_block = 0; k_block < hidden_dim_k_blocks; ++k_block) {
+                quantize_block_q8_0(
+                    ws.temp_row_buffer + k_block * QK8_0,
+                    x_d + i * hidden_dim_k_blocks + k_block,
+                    x_qs + i * hidden_dim + k_block * QK8_0
+                );
+            }
+        }
+
+        // --- C. EXPERT COMPUTATION (Tensor Parallel over tasks) ---
+        // Each thread processes tasks and writes its partial result to its local NUMA buffer.
+        for (int i = thread_id / numa_nodes; i < task_count; i += omp_max_threads / numa_nodes) {
+            const auto& task = tasks[i];
+            const int exp_id = task.expert_id;
+            const int count = task.num_tokens;
+            const int global_start_pos = task.global_token_start_pos;
+
+            // Pointers to the start of the correct expert's weights within the local NUMA buffer
+            const auto* local_gate_up_qs = static_cast<const int8_t*>(gate_up_qs_stacked_numa[node_id]);
+            const auto* local_gate_up_d = static_cast<const at::Half*>(gate_up_d_stacked_numa[node_id]);
+            const auto* local_down_proj_qs = static_cast<const int8_t*>(down_proj_qs_stacked_numa[node_id]);
+            const auto* local_down_proj_d = static_cast<const at::Half*>(down_proj_d_stacked_numa[node_id]);
+
+            const int8_t* gate_up_qs_ptr = local_gate_up_qs + exp_id * intermediate_size_x2_per_node * hidden_dim;
+            const at::Half* gate_up_d_ptr = local_gate_up_d + exp_id * intermediate_size_x2_per_node * (hidden_dim / QK8_0);
+            const int8_t* down_proj_qs_ptr = local_down_proj_qs + exp_id * hidden_dim * intermediate_size_per_node;
+            const at::Half* down_proj_d_ptr = local_down_proj_d + exp_id * hidden_dim * (intermediate_size_per_node / QK8_0);
+
+            pack_A_q8_0_from_quantized_indirect<ExecutionPolicy::Sequential>(
+                count, hidden_dim, x_qs, x_d, token_map.data(), global_start_pos,
+                ws.A_qs_packed1, ws.A_d_packed1
+            );
+
+            gemm_q8_0_compute_packed<ExecutionPolicy::Sequential>(
+                count, intermediate_size_x2_per_node, hidden_dim, ws.A_qs_packed1, ws.A_d_packed1,
+                gate_up_qs_ptr, reinterpret_cast<const ggml_half*>(gate_up_d_ptr),
+                ws.expert_intermediate1, intermediate_size_x2_per_node
+            );
+
+            silu_and_mul<ExecutionPolicy::Sequential>(ws.expert_intermediate1, count, intermediate_size_x2_per_node);
+
+            quantize_pack_A_q8_0<ExecutionPolicy::Sequential, float>(
+                count, intermediate_size_per_node, ws.expert_intermediate1, intermediate_size_x2_per_node,
+                ws.A_qs_packed2, ws.A_d_packed2
+            );
+            
+            // Write partial result to the local NUMA output buffer
+            gemm_q8_0_compute_packed<ExecutionPolicy::Sequential>(
+                count, hidden_dim, intermediate_size_per_node, ws.A_qs_packed2, ws.A_d_packed2,
+                down_proj_qs_ptr, reinterpret_cast<const ggml_half*>(down_proj_d_ptr),
+                expert_intermediate2_numa[node_id] + global_start_pos * hidden_dim, hidden_dim
+            );
+        }
+
+        // --- D. ALL-REDUCE STEP ---
+        // Synchronize to ensure all expert computations are complete before reducing.
+        #pragma omp barrier
+
+        // Parallel reduction of per-NUMA results into the final buffer
+        #pragma omp for schedule(static)
+        for (int64_t i = 0; i < total_expert_tokens * hidden_dim; ++i) {
+            float sum = 0.0f;
+            for (int n = 0; n < numa_nodes; ++n) {
+                sum += expert_intermediate2_numa[n][i];
+            }
+            final_expert_intermediate[i] = sum;
+        }
+
+        // --- E. SCATTER AND WEIGHTING (Parallel) ---
+        T* final_output_ptr = x_ptr; // Use raw pointer
+        #pragma omp for
+        for (int64_t t = 0; t < num_tokens; ++t) {
+            std::vector<float> acc_buffer(hidden_dim, 0.0f);
+            for (int k = 0; k < top_k; ++k) {
+                const int scatter_idx = t * top_k + k;
+                const int src_row_idx = scatter_map[scatter_idx];
+                if (src_row_idx == -1) continue;
+                const float weight = routing_weights_ptr[scatter_idx];
+                const float* src_row = final_expert_intermediate + src_row_idx * hidden_dim;
+                for (int j = 0; j < hidden_dim; ++j) {
+                    acc_buffer[j] += weight * src_row[j];
+                }
+            }
+            T* dst_row = final_output_ptr + t * hidden_dim;
+            for (int j = 0; j < hidden_dim; ++j) {
+                dst_row[j] = static_cast<T>(acc_buffer[j]);
+            }
+        }
+
+    } // End of parallel region
+
+    // =======================================================================
+    // 5. CLEANUP
+    // =======================================================================
+    std::free(x_qs);
+    std::free(x_d);
+    std::free(final_expert_intermediate);
+    for (int i = 0; i < numa_nodes; ++i) {
+#ifdef WITH_NUMA
+        if (numa_nodes > 1 && expert_intermediate2_numa[i]) {
+            numa_free(expert_intermediate2_numa[i], total_expert_tokens * hidden_dim * sizeof(float));
+        } else {
+            std::free(expert_intermediate2_numa[i]);
+        }
+#else
+        std::free(expert_intermediate2_numa[i]);
+#endif
+    }
+}
+
 template <typename T>
 torch::Tensor moe_q8_forward_impl(
     torch::Tensor x,
@@ -1236,16 +1453,6 @@ std::vector<torch::Tensor> gating_top_k_softmax(
     return {routing_weights_out, selected_experts_out};
 }
 
-template void gating_top_k_softmax_ptr_impl<float>(
-    const float* logits_ptr,
-    int64_t num_tokens,
-    int64_t num_experts,
-    int64_t top_k,
-    bool normalize,
-    float* routing_weights_out_ptr,
-    int32_t* selected_experts_out_ptr
-);
-
 template void gating_top_k_softmax_ptr_impl<at::Half>(
     const at::Half* logits_ptr,
     int64_t num_tokens,
@@ -1264,22 +1471,6 @@ template void gating_top_k_softmax_ptr_impl<at::BFloat16>(
     bool normalize,
     float* routing_weights_out_ptr,
     int32_t* selected_experts_out_ptr
-);
-
-template void moe_q8_forward_ptr_impl<float>(
-    float* x_ptr,
-    const float* routing_weights_ptr,
-    const int32_t* selected_experts_ptr,
-    const int8_t* gate_up_qs_stacked_ptr,
-    const at::Half* gate_up_d_stacked_ptr,
-    const int8_t* down_proj_qs_stacked_ptr,
-    const at::Half* down_proj_d_stacked_ptr,
-    int64_t num_tokens,
-    int64_t hidden_dim,
-    int64_t num_experts,
-    int64_t intermediate_size,
-    int64_t intermediate_size_x2,
-    int64_t top_k
 );
 
 template void moe_q8_forward_ptr_impl<at::Half>(
@@ -1313,6 +1504,33 @@ template void moe_q8_forward_ptr_impl<at::BFloat16>(
     int64_t intermediate_size_x2,
     int64_t top_k
 );
+
+template void moe_q8_forward_ptr_numa_impl<at::Half>(
+    at::Half* x_ptr,
+    const float* routing_weights_ptr,
+    const int32_t* selected_experts_ptr,
+    const std::vector<void*>& gate_up_qs_stacked_numa,
+    const std::vector<void*>& gate_up_d_stacked_numa,
+    const std::vector<void*>& down_proj_qs_stacked_numa,
+    const std::vector<void*>& down_proj_d_stacked_numa,
+    int64_t num_tokens, int64_t hidden_dim, int64_t num_experts,
+    int64_t intermediate_size,
+    int64_t top_k,
+    int numa_nodes);
+
+
+template void moe_q8_forward_ptr_numa_impl<at::BFloat16>(
+    at::BFloat16* x_ptr,
+    const float* routing_weights_ptr,
+    const int32_t* selected_experts_ptr,
+    const std::vector<void*>& gate_up_qs_stacked_numa,
+    const std::vector<void*>& gate_up_d_stacked_numa,
+    const std::vector<void*>& down_proj_qs_stacked_numa,
+    const std::vector<void*>& down_proj_d_stacked_numa,
+    int64_t num_tokens, int64_t hidden_dim, int64_t num_experts,
+    int64_t intermediate_size,
+    int64_t top_k,
+    int numa_nodes);
 
 #ifdef WITH_CUDA
 #include <cuda_runtime.h> // For cudaLaunchHostFunc
@@ -1382,7 +1600,7 @@ void launch_moe_cpu_task(
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     // These functions are for standard CPU execution and testing. They are unchanged.
-    m.def("quantize_repack_weight", &quantize_repack_weight, "Quantize and repack weight for q8_gemm");
+    m.def("quantize_weight_only", &quantize_weight_only, "Quantize weight for q8_gemm");
     m.def("q8_gemm", &q8_gemm, "q8_gemm kernel (A_fp32 @ B_q8.T)");
     m.def("moe_q8_forward", &moe_q8_forward, "Full MoE expert forward pass with int8 GEMM on CPU for float, bfloat16, and float16 inputs");
     m.def("gating_top_k_softmax", &gating_top_k_softmax, "Perform Top-K and Softmax on CPU for MoE gating, returning new tensors");

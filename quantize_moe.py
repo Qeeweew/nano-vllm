@@ -123,7 +123,7 @@ def quantize_moe_robust(model_path: str, output_path: str):
                 _, expert_idx_str, proj_name = match.groups()
                 expert_idx = int(expert_idx_str)
 
-                qs, d = nanovllm_ext.quantize_repack_weight(weight_fp32)
+                qs, d = nanovllm_ext.quantize_weight_only(weight_fp32)
                 del weight_fp32
 
                 if proj_name == "gate_proj":
