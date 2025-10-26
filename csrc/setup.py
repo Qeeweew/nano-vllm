@@ -12,7 +12,8 @@ setup(
             'nanovllm_ext',
             [
                 'q8_gemm.cpp',
-                'moe_infer.cpp'  # <-- ADD THIS NEW FILE
+                'moe_infer.cpp',
+                'pybind.cpp'
             ],
             define_macros=[('WITH_CUDA', None), ('WITH_NUMA', None)],
             extra_compile_args={

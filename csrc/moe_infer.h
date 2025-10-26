@@ -7,34 +7,6 @@
 #include <numa.h>
 #endif
 #include <omp.h>
-#include <numa.h>
-
-// Forward-declare the functions from the user's kernel implementations
-template <typename T>
-void gating_top_k_softmax_ptr_impl(
-    const T* logits_ptr, int64_t num_tokens, int64_t num_experts, int64_t top_k, bool normalize,
-    float* routing_weights_out, int32_t* selected_experts_out);
-
-template <typename T>
-void moe_q8_forward_ptr_impl(
-    T* hidden_states_ptr, const float* routing_weights_ptr, const int32_t* selected_experts_ptr,
-    const int8_t* gate_up_qs_ptr, const at::Half* gate_up_d_ptr,
-    const int8_t* down_proj_qs_ptr, const at::Half* down_proj_d_ptr,
-    int64_t num_tokens, int64_t hidden_dim, int64_t num_experts, int64_t int64_termediate_size, int64_t int64_termediate_size_x2, int64_t top_k);
-
-template <typename T>
-void moe_q8_forward_ptr_numa_impl(
-    T* x_ptr,
-    const float* routing_weights_ptr,
-    const int32_t* selected_experts_ptr,
-    const std::vector<void*>& gate_up_qs_stacked_numa,
-    const std::vector<void*>& gate_up_d_stacked_numa,
-    const std::vector<void*>& down_proj_qs_stacked_numa,
-    const std::vector<void*>& down_proj_d_stacked_numa,
-    int64_t num_tokens, int64_t hidden_dim, int64_t num_experts,
-    int64_t intermediate_size,
-    int64_t top_k,
-    int numa_nodes);
 
 class MoEInfer {
 public:

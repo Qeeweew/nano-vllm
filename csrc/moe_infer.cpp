@@ -1,15 +1,8 @@
 #include "moe_infer.h"
+#include "q8_gemm.h"
 #include <cstdio>
 #include <stdexcept>
 #include <cstring>
-
-// Forward-declare the quantization function from q8_gemm.cpp
-std::vector<torch::Tensor> quantize_weight_only(torch::Tensor B_float);
-template<typename D_TYPE> void repack_B_q8_0_from_ptr(
-    int64_t N, int64_t K,
-    const int8_t* src_qs, const D_TYPE* src_d,
-    int8_t* dest_qs_packed, D_TYPE* dest_d_packed
-);
 
 // Constructor, destructor, and weight loading methods remain the same as before...
 MoEInfer::MoEInfer(int64_t num_experts, int64_t hidden_size, int64_t intermediate_size)
